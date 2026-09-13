@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { resolve as resolvePath } from 'node:path';
-import { WebwayNode, type NodeOpts } from './node.ts';
+import { WebwayNode } from './node.ts';
 import { parseSearchOpts } from './args.ts';
+import { optsFromFlags, parse } from './cliopts.ts';
 
 const USAGE = `webway — Napster for model weights, on Mainline DHT
 
@@ -18,18 +19,9 @@ const USAGE = `webway — Napster for model weights, on Mainline DHT
   webway ls                                 what you hold
 
   flags: --peer host:port (extra DHT node, repeatable)  --torrent-port N  --dht-port N
+         --no-dns (skip DNS TXT seeds)  --dns-domain <d> (seed domain, repeatable)
   env:   WEBWAY_HOME (default ~/.webway)
 `;
-
-function parse(argv: string[]) {
-  const args: string[] = []; const flags: Record<string, string[]> = {};
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (a.startsWith('--')) (flags[a.slice(2)] ??= []).push(argv[++i] ?? 'true');
-    else args.push(a);
-  }
-  return { args, flags };
-}
 
 const fmt = (n: number) => n >= 1e9 ? `${(n / 1e9).toFixed(2)} GB` : n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${(n / 1e3).toFixed(0)} kB`;
 
@@ -37,7 +29,7 @@ async function main() {
   const { args, flags } = parse(process.argv.slice(2));
   const [cmd, ...rest] = args;
   if (!cmd || cmd === 'help') { console.log(USAGE); return; }
-  const opts: NodeOpts = { peers: flags.peer, torrentPort: Number(flags['torrent-port']?.[0]) || undefined, dhtPort: Number(flags['dht-port']?.[0]) || undefined };
+  const opts = optsFromFlags(flags);
   // validate search flags before paying for a node start
   const searchOpts = cmd === 'search' ? parseSearchOpts(flags) : {};
   const node = await new WebwayNode(opts).start();
