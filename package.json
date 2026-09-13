@@ -1,0 +1,29 @@
+{
+  "name": "webway",
+  "version": "0.1.0",
+  "description": "Napster for model weights, minus the part that got Napster shut down: signed names + Mainline DHT + BitTorrent",
+  "type": "module",
+  "license": "Apache-2.0",
+  "bin": {
+    "webway": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "node --experimental-strip-types src/cli.ts",
+    "test": "node --experimental-strip-types --test --test-force-exit test/*.test.ts"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.2",
+    "@types/webtorrent": "^3.0.0",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@noble/ed25519": "^3.2.0",
+    "bittorrent-dht": "^11.0.12",
+    "create-torrent": "^6.1.3",
+    "webtorrent": "^3.0.21"
+  }
+}
