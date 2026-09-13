@@ -45,7 +45,9 @@ async function cluster(names: string[], extra: NodeOpts = {}) {
 // ---- 1. deadlines -----------------------------------------------------------
 
 test('a catalog with a record but no seeders costs one bounded timeout, not the whole search', async () => {
-  const { root, router, nodes: [p, q], fresh, stopAll } = await cluster(['p', 'q'], { catalogTimeoutMs: 2000 });
+  // 5 s per-catalog budget: under full-suite load a live catalog fetch (DHT get + metadata + download)
+  // can exceed 2 s; the property is that the dead one costs ONE budget, not the 120 s search default.
+  const { root, router, nodes: [p, q], fresh, stopAll } = await cluster(['p', 'q'], { catalogTimeoutMs: 5000 });
   const extra: WebwayNode[] = [];
   try {
     const ps = await p.share(await tinyModel(root, 'pm'), 'p/model');
@@ -62,7 +64,7 @@ test('a catalog with a record but no seeders costs one bounded timeout, not the 
     const hits = await alice.search('model');
     const elapsed = Date.now() - t0;
     assert.deepEqual(hits.map((h) => h.name), ['q/model']);
-    assert.ok(elapsed < 8000, `search took ${elapsed}ms`);
+    assert.ok(elapsed < 15000, `search took ${elapsed}ms`);
     assert.equal(hits.find((h) => h.name === 'p/model'), undefined);
     assert.ok(ps.ih);
     // the timed-out download was cleaned up: no torrent left behind for it

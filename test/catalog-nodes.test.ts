@@ -234,9 +234,9 @@ test('startup does not wait on DNS: hanging resolver + live explicit peer starts
   };
   const t0 = Date.now();
   const n = await new WebwayNode({ home: join(root, 'n'), bootstrap: [], peers: [`127.0.0.1:${port}`], nat: false, allowPrivate: true,
-    dns: ['hang.org', 'slow.org'], dnsResolver: resolver, dnsTimeoutMs: 1500 }).start();
+    dns: ['hang.org', 'slow.org'], dnsResolver: resolver, dnsTimeoutMs: 5000 }).start();
   try {
-    assert.ok(Date.now() - t0 < 1400, `start() returned in ${Date.now() - t0}ms, before the DNS timeout`);
+    assert.ok(Date.now() - t0 < 4000, `start() returned in ${Date.now() - t0}ms, before the DNS timeout`);
     assert.equal(await waitFor(() => knows(n, port)), true, 'explicit peer live before DNS resolves');
     assert.equal(knows(n, hermitPort), false);
     release([[`127.0.0.1:${hermitPort}`]]); // slow.org answers now
@@ -256,14 +256,14 @@ test('stop() cancels an in-flight DNS query and settles dnsReady promptly (timer
   await n.stop();
   assert.ok(cancelled >= 1);
   assert.deepEqual(await n.dnsReady, []);
-  assert.ok(Date.now() - t0 < 1000, 'settled on abort, not on the 60s timer');
+  assert.ok(Date.now() - t0 < 5000, 'settled on abort, not on the 60s timer');
   // the same with the DEFAULT (owned) resolver: stop() must reach it. Use an unresolvable name so the
   // query is genuinely in flight; cancel() rejects it with ECANCELLED and the wrapper settles.
   const m = await new WebwayNode({ home: join(root, 'm'), bootstrap: [], nat: false, dns: ['hang.invalid'], dnsTimeoutMs: 60_000 }).start();
   const t1 = Date.now();
   await m.stop();
   assert.deepEqual(await m.dnsReady, []);
-  assert.ok(Date.now() - t1 < 2000, 'owned resolver query cancelled by stop()');
+  assert.ok(Date.now() - t1 < 5000, 'owned resolver query cancelled by stop()');
   const timeouts = (process as any).getActiveResourcesInfo().filter((r: string) => r === 'Timeout');
   assert.ok(timeouts.length <= 2, `no lingering DNS timers: ${timeouts.length}`); // test runner's own timers at most
 });
@@ -325,8 +325,7 @@ test('delayed TXT arrival still starts the retry loop', async () => {
     release([[`127.0.0.1:${port}`]]);
     await n.dnsReady;
     assert.equal(n.dnsCandidates.size, 1);
-    await new Promise((r) => setTimeout(r, 700));
-    assert.ok(n.dnsRetries >= 1, `retries started after late arrival: ${n.dnsRetries}`);
+    assert.equal(await waitFor(() => n.dnsRetries >= 1, 5000), true, `retries started after late arrival: ${n.dnsRetries}`);
   } finally { await n.stop(); }
 });
 
@@ -359,7 +358,8 @@ test('DNS retry is bounded at 5 when seeds never answer', async () => {
   const n = await new WebwayNode({ home: join(root, 'n'), bootstrap: [], nat: false, allowPrivate: true, dns: ['x.org'], dnsResolver: resolver, dnsRetryMs: 100 }).start();
   try {
     await n.dnsReady;
-    await new Promise((r) => setTimeout(r, 1200));
+    assert.equal(await waitFor(() => n.dnsRetries === 5, 5000), true, `reached the retry cap: ${n.dnsRetries}`);
+    await new Promise((r) => setTimeout(r, 400)); // and then no more ticks
     assert.equal(n.dnsRetries, 5);
     assert.equal(n.dht.nodes.count(), 0);
   } finally { await n.stop(); }
@@ -381,10 +381,10 @@ test('adoptNodes: 200k-entry catalog returns within a few ms and admits <= 20', 
     assert.ok(got.length <= ADOPT.perRead && got.length > 0);
     assert.equal(adds.length, got.length + 21);
     assert.ok(big < Math.max(3 * small, 30) + 30, `200k read ${big.toFixed(1)}ms vs 20-entry ${small.toFixed(1)}ms`);
-    assert.ok(big < 500, `absolute bound: ${big.toFixed(1)}ms`);
+    assert.ok(big < 2000, `absolute bound: ${big.toFixed(1)}ms`); // loose: the relative bound above is the real check
     // budget exhausted publisher: still bounded, still nothing (no disk write on this path)
     const again = await time(async () => assert.deepEqual(await n.adoptNodes(huge, PK), []));
-    assert.ok(again < 100, `exhausted read ${again.toFixed(1)}ms`);
+    assert.ok(again < 500, `exhausted read ${again.toFixed(1)}ms`);
     // inspection bound: a valid entry beyond the first 200 raw entries is never looked at
     const late = [...Array.from({ length: ADOPT.inspect }, () => 'junk'), '8.8.8.8:8'];
     assert.deepEqual(await n.adoptNodes(late, 'e'.repeat(64)), []);

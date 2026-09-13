@@ -254,12 +254,28 @@ export class Lock {
       return true;
     };
     if (!(await make())) {
-      if (!(await isStale(dir, o.staleMs ?? STALE_MS))) return undefined;
-      // Reclaim: move the stale dir aside (only one reclaimer's rename succeeds), then create ours.
-      const aside = `${dir}.stale.${Math.random().toString(36).slice(2)}`;
-      try { await rename(dir, aside); } catch (e: any) { if (e.code !== 'ENOENT') throw e; }
-      rm(aside, { recursive: true, force: true }).catch(() => {});
-      if (!(await make())) return undefined;
+      const staleMs = o.staleMs ?? STALE_MS;
+      if (!(await isStale(dir, staleMs))) return undefined;
+      // Reclaim under a guard directory: rename-aside alone is not enough, because a second
+      // reclaimer's rename can move the FIRST reclaimer's freshly created lock aside and then
+      // mkdir its own (two holders — seen in R4 under load). Only the reclaimer that creates
+      // `<dir>.reclaim` proceeds; a guard older than staleMs belongs to a crashed reclaimer.
+      const guard = `${dir}.reclaim`;
+      const takeGuard = async (): Promise<boolean> => {
+        try { await mkdir(guard); return true; } catch (e: any) { if (e.code !== 'EEXIST') throw e; }
+        const st = await lstat(guard).catch(() => undefined);
+        if (!st || Date.now() - st.mtimeMs <= staleMs) return false; // live reclaimer: we lose
+        await rm(guard, { recursive: true, force: true });
+        try { await mkdir(guard); return true; } catch { return false; }
+      };
+      if (!(await takeGuard())) return undefined;
+      try {
+        if (!(await isStale(dir, staleMs))) return undefined; // re-check: someone may have reclaimed and released meanwhile
+        const aside = `${dir}.stale.${Math.random().toString(36).slice(2)}`;
+        try { await rename(dir, aside); } catch (e: any) { if (e.code !== 'ENOENT') throw e; }
+        rm(aside, { recursive: true, force: true }).catch(() => {});
+        if (!(await make())) return undefined; // a fresh acquirer slipped in between rename and mkdir: it holds the lock
+      } finally { await rm(guard, { recursive: true, force: true }); }
     }
     const lock = new Lock(dir);
     const hbMs = o.heartbeatMs ?? HEARTBEAT_MS;

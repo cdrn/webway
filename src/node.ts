@@ -28,6 +28,9 @@ export const MAX_DHT_SEQ = BigInt(Number.MAX_SAFE_INTEGER);
  *  - dies only with Mainline: ~10M nodes, nobody owns it
  */
 
+/** Connection-reset error codes that are noise during shutdown (uTP native + TCP). */
+const RESET_CODES = new Set(['UTP_ECONNRESET', 'ECONNRESET', 'UTP_ETIMEDOUT', 'EPIPE']);
+
 export const EXTRA_BOOTSTRAP = [
   'router.bittorrent.com:6881',
   'router.utorrent.com:6881',
@@ -63,6 +66,7 @@ export interface NodeOpts {
   peers?: string[]; // extra DHT nodes host:port
   nat?: boolean; // UPnP/NAT-PMP port mapping (default on)
   chain?: ChainRegistry | false; // on-chain registry as a second resolution path (issue #9)
+  utp?: boolean; // uTP transport for peer connections (default on)
   catalogTimeoutMs?: number; // per-publisher catalog fetch deadline (default 20s)
   searchTimeoutMs?: number; // overall search deadline (default 120s)
   catalogCacheMax?: number; // in-memory parsed-catalog cache entries (default 200; 0 = no cache)
@@ -271,6 +275,7 @@ export class WebwayNode {
       natPmp: this.opts.nat ?? true,
       tracker: false, // DHT + PEX only; nothing to subpoena
       lsd: true, // BEP14: find peers on the LAN with no DHT at all
+      utp: this.opts.utp ?? true,
     };
     // webtorrent binds uTP (UDP) on whatever port the kernel gave its TCP server; when that UDP
     // port is already taken the client dies with EADDRINUSE. Bounded retry with a fresh client
@@ -283,6 +288,15 @@ export class WebwayNode {
         if (e?.code !== 'EADDRINUSE' || attempt >= 5 || this.opts.torrentPort || this.opts.dhtPort) throw e;
       }
     }
+    // After startup the client has no 'error' listener, so any late error would throw as an
+    // uncaught exception. uTP/TCP resets are routine while tearing down (a peer we are
+    // disconnecting from resets first); swallow only those, only while stopping (#11).
+    // Everything else still propagates exactly as it would with no listener.
+    this.client.on('error', (e: any) => {
+      if (this.stopping && RESET_CODES.has(e?.code)) return;
+      throw e;
+    });
+    this.sinkUtpErrors();
     // Immediate pings only for --peer values that survived the merged, capped list (never the raw array).
     this.startupPeers = startupPeerPings(bootstrap, peers);
     for (const p of this.startupPeers) { const a = parseHostPort(p); if (a) this.dht.addNode({ host: a.host, port: a.port }); }
@@ -383,6 +397,23 @@ export class WebwayNode {
     if (this.wasPopulated) { this.wasPopulated = false; this.armDiscovery(); this.scheduleDnsRetry(); }
   }
 
+  /**
+   * utp-native re-emits the error a Connection was destroyed with from its native close
+   * callback (Connection._onclose: `if (this._error) this.emit('error', ...)`). webtorrent
+   * listens with `conn.once('error')`, so that second emit finds no listener and becomes an
+   * uncaught exception — typically UTP_ECONNRESET when a peer tears down first (#11). Give
+   * every uTP connection, incoming and outgoing, a persistent sink at creation.
+   */
+  private sinkUtpErrors(): void {
+    const utp: any = (this.client as any)._utpServer;
+    if (!utp || utp.__webwaySink) return;
+    utp.__webwaySink = true;
+    const sink = (c: any) => { try { c.on('error', () => {}); } catch {} };
+    utp.on('connection', sink);
+    const connect = utp.connect.bind(utp);
+    utp.connect = (...a: unknown[]) => { const c = connect(...a); sink(c); return c; };
+  }
+
   /** Resolve once both the DHT socket and the torrent (TCP + uTP) server are listening; reject on a startup error. */
   private waitListening(): Promise<void> {
     const c: any = this.client;
@@ -446,7 +477,29 @@ export class WebwayNode {
     this.dnsAbort.abort();
     try { this.dnsResolverHandle?.cancel(); } catch {}
     try { await this.writeJson('dht.json', { nodes: this.dht?.toJSON().nodes ?? [] }); } catch {}
+    // webtorrent nulls its conn pool inside destroy(), so take the uTP server first.
+    const utp: any = (this.client as any)._utpServer;
+    // A uTP connection whose peer resets during teardown emits 'error' (UTP_ECONNRESET) from
+    // its native close callback, which can land after webtorrent has dropped its listeners:
+    // with no listener left that emit is an uncaught exception (#11). Keep a sink on every
+    // connection that is still open when we begin shutting down.
+    for (const c of (utp?.connections ?? []) as any[]) { try { c.on('error', () => {}); } catch {} }
     await new Promise<void>((r) => this.client.destroy(() => r()));
+    // utp-native (issue #8): UTP.close() defers the native utp_napi_close until every
+    // Connection has finished its FIN handshake, and libutp waits ~30 s for a peer that has
+    // already gone away. That native UDP handle is ref'd and invisible to
+    // process._getActiveHandles(), so it silently held the event loop open. webtorrent's
+    // destroy callback does not wait for it. Unref it so a lingering close can't keep the
+    // process alive; libutp still finishes (or times out) in the background.
+    if (utp && !utp._closed) {
+      // Before letting the process exit with libutp still winding down: refuse incoming uTP
+      // connections. Otherwise a late SYN drained during Environment::CleanupHandles reaches
+      // utp_call_on_accept -> napi_get_buffer_info on a torn-down env and the process dies
+      // with SIGSEGV at exit (seen ~1 in 2 runs of the chain tests once exits were natural).
+      try { utp.firewall(true); } catch {}
+      for (const c of (utp.connections ?? []) as any[]) { try { c.destroy(); } catch {} }
+      try { utp.unref(); } catch {}
+    }
   }
 
   // ---- persistence -------------------------------------------------------

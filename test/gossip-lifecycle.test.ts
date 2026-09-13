@@ -107,7 +107,8 @@ test('A2: two publishers sharing one stalled torrent; the short-deadline caller 
     await waitUntil(() => refs(alice).get(S)?.readers === 1, 'p acquires S'); // DHT lookup + acquire, timing varies under load
     const t0 = Date.now();
     assert.deepEqual(await alice.catalogFull(q.pk, 300), { entries: [], endorse: [] });
-    assert.ok(Date.now() - t0 < 1500);
+    // 300 ms deadline; a caller wrongly joined to p's 2500 ms load would take ~2500 ms. 2000 still distinguishes under load.
+    assert.ok(Date.now() - t0 < 2000, `short caller took ${Date.now() - t0}ms`);
     await alice.lifecycleIdle();
     assert.ok(await alive(alice, S), 'S still alive: p is still waiting on it');
     assert.equal(refs(alice).get(S)?.readers, 1);
@@ -161,7 +162,8 @@ test('B: a short-deadline caller joining a long in-flight load leaves at its own
     const t0 = Date.now();
     assert.deepEqual(await alice.catalogFull(p.pk, 30), { entries: [], endorse: [] }); // same pk/ih key: coalesced
     const elapsed = Date.now() - t0;
-    assert.ok(elapsed < 150, `short caller took ${elapsed}ms`);
+    // 30 ms deadline vs a 2000 ms shared load: anything under ~600 ms proves it left on its own deadline.
+    assert.ok(elapsed < 600, `short caller took ${elapsed}ms`);
     // the shared load is still running for the long caller
     assert.equal(refs(alice).get(S)?.readers, 1);
     assert.ok(await alive(alice, S));
@@ -180,11 +182,12 @@ test('B: search deadline shorter than an in-flight load completes quickly', asyn
     await pointOwn(p, S);
     const alice = await fresh('alice', { searchTimeoutMs: 10 });
     await alice.follow(p.pk);
-    const long = alice.catalogFull(p.pk, 160);
+    const long = alice.catalogFull(p.pk, 1000);
     await sleep(20);
     const t0 = Date.now();
     assert.deepEqual(await alice.search('x'), []);
-    assert.ok(Date.now() - t0 < 60, 'search bounded by its own deadline');
+    // 10 ms search deadline vs a 1000 ms in-flight load: < 400 ms proves the search did not wait for the load.
+    assert.ok(Date.now() - t0 < 400, `search took ${Date.now() - t0}ms, not bounded by its own deadline`);
     await long;
     await alice.lifecycleIdle();
   } finally { await stopAll(); }
