@@ -2,9 +2,11 @@ import WebTorrent, { type Torrent } from 'webtorrent';
 import bencode from 'bencode';
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile, rm, rmdir } from 'node:fs/promises';
+import { atomicWriteJson } from './atomic.ts';
 import { join, basename, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { loadOrCreate, sign, verify, type Keypair } from './keys.ts';
+import { DNS_SEED_DOMAINS, LIMITS, advertisableNodes, canonicalEndpoints, dnsSeeds, formatHostPort, isPrivateHost, mergeBootstrap, ownedResolver, parseHostPort, startupPeerPings, subnetKey, usable, type CancellableResolver, type TxtResolver } from './bootstrap.ts';
 
 /**
  * A webway node = a BitTorrent client + a Mainline DHT node + a publisher key.
@@ -14,7 +16,8 @@ import { loadOrCreate, sign, verify, type Keypair } from './keys.ts';
  *  - unforgeable content:     infohash is the content
  *  - unforgeable names:       webway://<ed25519 pk>/<name> is a BEP44 mutable
  *                             item signed by the publisher; DHT nodes reject bad sigs
- *  - no single bootstrap:     builtin routers + persisted routing table + --peer
+ *  - no single bootstrap:     builtin routers + persisted routing table + DNS TXT
+ *                             seeds + --peer + nodes carried in catalogs + LSD
  *  - NAT traversal:           uTP + UPnP/NAT-PMP via webtorrent; PEX (BEP11)
  *  - dies only with Mainline: ~10M nodes, nobody owns it
  */
@@ -31,7 +34,9 @@ export interface Record_ { ih: string; name: string; size: number; license?: str
 /** A signed BEP44 item we hold and will keep alive on behalf of its publisher. */
 export interface HeldRecord { k: string; salt: string; v: string; sig: string; seq: number }
 export interface CatalogEntry { name: string; ih: string; size: number; license?: string }
-export interface Catalog { entries: CatalogEntry[]; endorse: string[] }
+/** nodes: raw `host:port` strings the publisher advertises (#4), present only when non-empty; validated and rationed by adoptNodes(), not here. */
+export interface Catalog { entries: CatalogEntry[]; endorse: string[]; nodes?: string[] }
+const emptyCatalog = (): Catalog => ({ entries: [], endorse: [] });
 export interface SearchHit extends CatalogEntry { pk: string; hops: number }
 export interface SearchOpts { depth?: number; maxPublishers?: number }
 /** Lifecycle record for one catalog torrent (one per infohash). */
@@ -49,6 +54,60 @@ export interface NodeOpts {
   searchTimeoutMs?: number; // overall search deadline (default 120s)
   catalogCacheMax?: number; // in-memory parsed-catalog cache entries (default 200; 0 = no cache)
   catalogTorrentsMax?: number; // owned catalog torrents kept alive (default 200, LRU)
+  dns?: boolean | string[]; // DNS TXT seeds: true = DNS_SEED_DOMAINS, false = skip, array = those domains
+  allowPrivate?: boolean; // advertise/adopt private/loopback nodes (tests only)
+  dnsResolver?: TxtResolver | CancellableResolver; // test hook
+  dnsTimeoutMs?: number;
+  dnsRetryMs?: number; // test hook: interval between DNS-seed bootstrap retries (default 30s)
+}
+
+/** Catalog-node adoption limits (#4 review). Publishers recommend nodes; we ration how far we trust that. */
+export const ADOPT = {
+  perPublisher: 20, // lifetime, persisted in dht-adopt.json
+  perSession: 100,
+  perSubnetPerPublisher: 4, // /24
+  perRead: 20,
+  inspect: 200, // raw catalog entries looked at per read, valid or not
+  tableFull: 200, // routing-table size beyond which only never-seen addresses are considered
+  reAdvertiseAfterMs: 60 * 60_000, // adopted nodes are not vouched for in our own catalog until this old
+  provenanceTtlMs: 24 * 60 * 60_000, // forget adoption timestamps older than this
+} as const;
+
+/** DNS seeds stay retryable: if the table is still empty after bootstrap, re-ping them a bounded number of times. */
+export const DNS_RETRY = { intervalMs: 30_000, max: 5 } as const;
+
+interface AdoptState { n: number; seen: string[]; subnets: Record<string, number> }
+interface AdoptFile { publishers: Record<string, AdoptState>; adopted: Record<string, number> }
+
+/** Publisher keys are 32-byte ed25519 keys in hex; hex case carries no identity. */
+export function canonPk(pk: unknown): string | undefined {
+  return typeof pk === 'string' && /^[0-9a-fA-F]{64}$/.test(pk) ? pk.toLowerCase() : undefined;
+}
+
+/** Validate dht-adopt.json, resetting only the corrupt parts and merging case-variant publisher keys. */
+export function sanitizeAdoptFile(raw: unknown): AdoptFile {
+  const out: AdoptFile = { publishers: {}, adopted: {} };
+  const r = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+  const pubs = (r.publishers && typeof r.publishers === 'object' ? r.publishers : {}) as Record<string, unknown>;
+  for (const [k, v] of Object.entries(pubs)) {
+    const pk = canonPk(k);
+    if (!pk || !v || typeof v !== 'object') continue;
+    const s = v as Record<string, unknown>;
+    const seen = Array.isArray(s.seen) ? s.seen.filter((x): x is string => typeof x === 'string' && !!parseHostPort(x)) : [];
+    const subnets: Record<string, number> = {};
+    if (s.subnets && typeof s.subnets === 'object') for (const [sub, n] of Object.entries(s.subnets as Record<string, unknown>)) if (Number.isInteger(n) && (n as number) > 0) subnets[sub] = n as number;
+    const n = Number.isInteger(s.n) && (s.n as number) >= 0 ? (s.n as number) : seen.length;
+    const cur = out.publishers[pk];
+    if (!cur) out.publishers[pk] = { n, seen, subnets };
+    else { // case variant of a key we already have: budgets are one budget
+      cur.n += n; cur.seen = [...new Set([...cur.seen, ...seen])];
+      for (const [sub, c] of Object.entries(subnets)) cur.subnets[sub] = (cur.subnets[sub] ?? 0) + c;
+    }
+  }
+  const ad = (r.adopted && typeof r.adopted === 'object' ? r.adopted : {}) as Record<string, unknown>;
+  const now = Date.now();
+  for (const [addr, t] of Object.entries(ad)) if (parseHostPort(addr) && Number.isFinite(t) && (t as number) <= now && now - (t as number) < ADOPT.provenanceTtlMs) out.adopted[addr] = t as number;
+  return out;
 }
 
 /** Where a torrent's files landed: multi-file torrents nest under t.name, single-file ones don't. */
@@ -62,6 +121,25 @@ export class WebwayNode {
   key!: Keypair;
   private timers: NodeJS.Timeout[] = [];
   private opts: NodeOpts;
+  /** Resolves with the DNS seed endpoints once they arrive (never blocks start()). */
+  dnsReady: Promise<string[]> = Promise.resolve([]);
+  private dnsResolverHandle: CancellableResolver | undefined;
+  private dnsAbort = new AbortController();
+  /** DNS seeds we have heard of this session, kept as retryable bootstrap candidates (bounded). */
+  readonly dnsCandidates = new Set<string>();
+  private dnsRetryTimer: NodeJS.Timeout | undefined;
+  dnsRetries = 0;
+  /** How many first-contact self-lookups we have run (one per isolation episode at most). */
+  dnsLookups = 0;
+  private discoveryListener: (() => void) | undefined;
+  private wasPopulated = false;
+  /** The --peer values actually pinged at startup (subset of the capped bootstrap list). */
+  startupPeers: string[] = [];
+  private stopping = false;
+  /** addr -> when we adopted it from someone's catalog (provenance; not re-advertised while fresh). Persisted. */
+  private adopted = new Map<string, number>();
+  private adoptedThisSession = 0;
+  private adoptChain: Promise<unknown> = Promise.resolve();
 
   constructor(opts: NodeOpts = {}) {
     if (opts.catalogTimeoutMs !== undefined) checkInt('catalogTimeoutMs', opts.catalogTimeoutMs, WebwayNode.CATALOG_TIMEOUT_MAX_MS);
@@ -80,11 +158,19 @@ export class WebwayNode {
     await mkdir(this.modelsDir(), { recursive: true });
     this.key = await loadOrCreate(join(this.home, 'key.json'));
     const saved = await this.readJson<{ nodes?: any[] }>('dht.json', {});
-    // Bootstrap set = builtin routers + nodes we knew last session + anything passed on the CLI.
+    // Bootstrap set = builtin routers + nodes we knew last session + DNS TXT seeds + anything passed on the CLI.
     // (k-rpc treats a non-empty `nodes` as a replacement for `bootstrap`, so we merge by hand.)
-    const remembered = (saved.nodes ?? []).map((n: any) => `${n.host}:${n.port}`).slice(0, 50);
+    const remembered = advertisableNodes(saved.nodes ?? [], LIMITS.rememberedCap, true);
+    // Validate --peer values: a junk entry must not crash the DHT socket; IPv6 is unusable (udp4 transport).
+    const peers = canonicalEndpoints(this.opts.peers ?? []);
+    // DNS never delays startup: the DHT starts on builtin + remembered + peers and DNS seeds are
+    // added as they arrive (their query is cancelled on timeout or stop()).
     const bootstrap = this.opts.bootstrap === false ? false
-      : [...(this.opts.bootstrap ?? EXTRA_BOOTSTRAP), ...remembered, ...(this.opts.peers ?? [])];
+      : mergeBootstrap({ builtin: this.opts.bootstrap ?? EXTRA_BOOTSTRAP, remembered, dns: false, peers });
+    const dnsDomains = this.opts.dns === false ? false : Array.isArray(this.opts.dns) ? this.opts.dns : DNS_SEED_DOMAINS;
+    // Restore adoption provenance before anything can publish a catalog.
+    const adoptFile = sanitizeAdoptFile(await this.readJson<unknown>('dht-adopt.json', {}));
+    for (const [addr, t] of Object.entries(adoptFile.adopted)) this.adopted.set(addr, t);
     this.client = new WebTorrent({
       torrentPort: this.opts.torrentPort ?? 0,
       dhtPort: this.opts.dhtPort ?? 0,
@@ -92,22 +178,114 @@ export class WebwayNode {
       natUpnp: this.opts.nat ?? true,
       natPmp: this.opts.nat ?? true,
       tracker: false, // DHT + PEX only; nothing to subpoena
+      lsd: true, // BEP14: find peers on the LAN with no DHT at all
     } as any);
     await new Promise<void>((r) => this.dht.once('listening', r));
-    for (const p of this.opts.peers ?? []) this.dht.addNode(this.parseAddr(p));
+    // Immediate pings only for --peer values that survived the merged, capped list (never the raw array).
+    this.startupPeers = startupPeerPings(bootstrap, peers);
+    for (const p of this.startupPeers) { const a = parseHostPort(p); if (a) this.dht.addNode({ host: a.host, port: a.port }); }
+    if (bootstrap !== false && dnsDomains !== false) {
+      // We own the resolver: stop() cancels it (pending queries reject) and aborts the wrapper
+      // (settles the promise, clears its timers) whatever the resolver does.
+      const given = this.opts.dnsResolver;
+      this.dnsResolverHandle = !given ? ownedResolver() : typeof given === 'function' ? { resolveTxt: given, cancel() {} } : given;
+      const admitted: string[] = [];
+      // Only what mergeBootstrap would have admitted: cap total against the reserved list.
+      let room = Math.max(0, LIMITS.bootstrapTotal - bootstrap.length);
+      const admit = (seeds: string[]) => {
+        if (this.stopping || !this.dht || this.dht.destroyed) return;
+        const fresh: string[] = [];
+        for (const s of seeds) {
+          if (room <= 0 || this.dnsCandidates.size >= LIMITS.dnsEndpointsTotal) break;
+          if (bootstrap.includes(s) || this.dnsCandidates.has(s)) continue;
+          this.dnsCandidates.add(s); room--; admitted.push(s); fresh.push(s);
+        }
+        if (!fresh.length) return;
+        // First-contact discovery is armed BEFORE the seed pings so an immediately successful ping
+        // counts; only now, when DNS seeds exist (the ordinary bootstrap list populates the table itself).
+        this.armDiscovery();
+        for (const s of fresh) { const a = parseHostPort(s); if (a) this.dht.addNode({ host: a.host, port: a.port }); }
+        this.scheduleDnsRetry(); // candidates arriving late must still get the retry loop
+      };
+      // Per-domain emission: a fast domain's seeds go in before a hanging one times out.
+      this.dnsReady = dnsSeeds(dnsDomains, this.dnsResolverHandle, this.opts.dnsTimeoutMs, { signal: this.dnsAbort.signal, onDomain: admit })
+        .then(() => admitted).catch(() => admitted);
+    }
     // Wait (bounded) for the routing table to populate so puts/gets have somewhere to go.
-    if (bootstrap !== false) await Promise.race([new Promise<void>((r) => this.dht.once('ready', r)), new Promise<void>((r) => setTimeout(r, 15_000).unref())]);
-    // Persist the routing table so we can rejoin even if every bootstrap router is gone.
-    const persist = () => this.writeJson('dht.json', { nodes: this.dht.toJSON().nodes }).catch(() => {});
+    // (An empty list can never populate anything: don't sit through the 15 s for it.)
+    if (bootstrap !== false && bootstrap.length > 0) await Promise.race([new Promise<void>((r) => this.dht.once('ready', r)), new Promise<void>((r) => setTimeout(r, 15_000).unref())]);
+    if (bootstrap !== false && dnsDomains !== false) this.scheduleDnsRetry();
+    // Persist the routing table so we can rejoin even if every bootstrap router is gone,
+    // and notice if we have become isolated (retry DNS seeds again).
+    const persist = () => { this.checkIsolation(); this.writeJson('dht.json', { nodes: this.dht.toJSON().nodes }).catch(() => {}); };
     this.timers.push(setInterval(persist, 60_000));
     this.timers[0].unref();
     return this;
   }
 
-  private parseAddr(s: string) { const i = s.lastIndexOf(':'); return { host: s.slice(0, i), port: Number(s.slice(i + 1)) }; }
+  /**
+   * Arm one-shot first-contact discovery: when the routing table is empty and a node
+   * answers, look up our own id through it to populate the table. Armed only while the
+   * table is empty; re-armed by checkIsolation() if we later lose every contact.
+   */
+  private armDiscovery(): void {
+    if (this.discoveryListener || this.stopping || !this.dht || this.dht.destroyed) return;
+    if (this.dht.nodes.count() > 0) return; // bootstrap population already handles a non-empty table
+    const onNode = () => {
+      this.disarmDiscovery();
+      if (this.stopping || this.dht.destroyed) return;
+      this.dnsLookups++;
+      this.dht.lookup(this.dht.nodeId, () => {});
+    };
+    this.discoveryListener = onNode;
+    this.dht.on('node', onNode);
+  }
+
+  private disarmDiscovery(): void {
+    if (!this.discoveryListener) return;
+    this.dht?.removeListener('node', this.discoveryListener);
+    this.discoveryListener = undefined;
+  }
+
+  /**
+   * DNS seeds are not one-shot pings: while the routing table is empty, re-ping the
+   * candidates every DNS_RETRY.intervalMs, at most DNS_RETRY.max times (per isolation
+   * episode). Scheduled after bootstrap, whenever candidates arrive, and whenever
+   * checkIsolation() finds the table empty again.
+   */
+  private scheduleDnsRetry(): void {
+    if (this.stopping || this.dnsRetryTimer || !this.dht || this.dht.destroyed) return;
+    if (this.dnsCandidates.size === 0) return;
+    const interval = this.opts.dnsRetryMs ?? DNS_RETRY.intervalMs;
+    const tick = () => {
+      this.dnsRetryTimer = undefined;
+      if (this.stopping || !this.dht || this.dht.destroyed) return;
+      if (this.dht.nodes.count() > 0 || this.dnsRetries >= DNS_RETRY.max) return;
+      this.dnsRetries++;
+      this.armDiscovery();
+      for (const s of this.dnsCandidates) { const a = parseHostPort(s); if (a) this.dht.addNode({ host: a.host, port: a.port }); }
+      this.dnsRetryTimer = setTimeout(tick, interval);
+      this.dnsRetryTimer.unref();
+    };
+    // First tick waits one interval: the seeds were pinged on admission; only retry if that failed.
+    this.dnsRetryTimer = setTimeout(tick, interval);
+    this.dnsRetryTimer.unref();
+  }
+
+  /** Populated -> reset the retry budget; populated-then-empty -> start a new retry episode. */
+  checkIsolation(): void {
+    if (this.stopping || !this.dht || this.dht.destroyed) return;
+    if (this.dht.nodes.count() > 0) { this.dnsRetries = 0; this.wasPopulated = true; return; }
+    if (this.wasPopulated) { this.wasPopulated = false; this.armDiscovery(); this.scheduleDnsRetry(); }
+  }
 
   async stop(): Promise<void> {
+    this.stopping = true; // set before any await: nothing is admitted while we wind down
     for (const t of this.timers) clearInterval(t);
+    if (this.dnsRetryTimer) { clearTimeout(this.dnsRetryTimer); this.dnsRetryTimer = undefined; }
+    this.disarmDiscovery();
+    this.dnsAbort.abort();
+    try { this.dnsResolverHandle?.cancel(); } catch {}
     try { await this.writeJson('dht.json', { nodes: this.dht?.toJSON().nodes ?? [] }); } catch {}
     await new Promise<void>((r) => this.client.destroy(() => r()));
   }
@@ -117,10 +295,8 @@ export class WebwayNode {
   private async readJson<T>(f: string, dflt: T): Promise<T> {
     try { return JSON.parse(await readFile(join(this.home, f), 'utf8')); } catch { return dflt; }
   }
-  private async writeJson(f: string, v: unknown) {
-    await mkdir(this.home, { recursive: true });
-    await writeFile(join(this.home, f), JSON.stringify(v, null, 2));
-  }
+  /** Atomic + serialised per path (see atomic.ts); a crash never leaves truncated JSON. */
+  private writeJson(f: string, v: unknown) { return atomicWriteJson(this.home, f, v); }
   shares() { return this.readJson<Share[]>('shares.json', []); }
   private async upsertShare(s: Share) {
     const all = (await this.shares()).filter((x) => x.ih !== s.ih);
@@ -129,8 +305,9 @@ export class WebwayNode {
   }
   follows() { return this.readJson<string[]>('follows.json', []); }
   async follow(pk: string) {
-    if (!/^[0-9a-f]{64}$/.test(pk)) throw new Error('publisher key must be 64 hex chars');
-    const f = new Set(await this.follows()); f.add(pk);
+    const c = canonPk(pk);
+    if (!c) throw new Error('publisher key must be 64 hex chars');
+    const f = new Set(await this.follows()); f.add(c);
     await this.writeJson('follows.json', [...f]);
   }
 
@@ -268,7 +445,12 @@ export class WebwayNode {
     await mkdir(dir, { recursive: true });
     // endorse = who we follow; other nodes walk this to widen search (#3)
     const endorse = (await this.follows()).filter((pk) => pk !== this.pk);
-    await writeFile(join(dir, 'catalog.json'), JSON.stringify({ pk: this.pk, entries, endorse }, null, 2));
+    // nodes = some of our routing table so anyone who reads this catalog can bootstrap from it (#4).
+    // Never vouch for a node we only recently adopted from someone else's catalog (no transitive laundering).
+    const now = Date.now();
+    const recentlyAdopted = (addr: string) => { const t = this.adopted.get(addr); return t !== undefined && now - t < ADOPT.reAdvertiseAfterMs; };
+    const nodes = advertisableNodes(this.dht.toJSON().nodes ?? [], LIMITS.advertise, this.opts.allowPrivate ?? false, recentlyAdopted);
+    await writeFile(join(dir, 'catalog.json'), JSON.stringify({ pk: this.pk, entries, endorse, nodes }, null, 2));
     for (const t of this.client.torrents) if (t.name === 'catalog') await new Promise<void>((r) => t.destroy({}, () => r()));
     const t = await this.seed(dir, 'catalog');
     const seq = await this.nextSeq('catalog');
@@ -346,8 +528,72 @@ export class WebwayNode {
   get catalogTorrentCount() { return [...this.refs.values()].filter((r) => r.owned && !(r.torrent as any).destroyed).length; }
 
   /** Fetch a publisher's catalog torrent and return its entries. */
-  async catalog(pk: string): Promise<CatalogEntry[]> {
+  async catalog(rawPk: string): Promise<CatalogEntry[]> {
+    const pk = canonPk(rawPk);
+    if (!pk) throw new Error('publisher key must be 64 hex chars');
     return (await this.catalogFull(pk)).entries;
+  }
+
+  /** Per-publisher adoption accounting (validated, case-variants merged). */
+  async adoptState(): Promise<Record<string, AdoptState>> { return (await this.loadAdopt()).publishers; }
+  private async loadAdopt(): Promise<AdoptFile> { return sanitizeAdoptFile(await this.readJson<unknown>('dht-adopt.json', {})); }
+
+  /**
+   * Add catalog-carried DHT nodes to our routing table, rationed (#4 review).
+   * One serialised transaction per call (concurrent reads cannot double-spend), one
+   * pass over at most ADOPT.inspect raw entries: parse, filter (public IPv4 literals
+   * only unless allowPrivate; no hostnames, no IPv6), dedupe within the read (Set) and
+   * across reads (persisted per publisher), then budget: ADOPT.perRead per call,
+   * ADOPT.perPublisher per publisher key ever, ADOPT.perSubnetPerPublisher per /24 per
+   * publisher, ADOPT.perSession per process; once the routing table holds >=
+   * ADOPT.tableFull nodes only never-seen addresses are considered. Addresses already
+   * in our routing table were learned independently: skipped, no budget, no provenance.
+   * Stops as soon as a cap or budget is hit. Returns the addresses handed to the DHT
+   * (which pings before inserting).
+   */
+  adoptNodes(nodes: unknown, rawPk: unknown): Promise<string[]> {
+    const pk = canonPk(rawPk);
+    if (!Array.isArray(nodes) || !pk || nodes.length === 0) return Promise.resolve([]);
+    const run = this.adoptChain.then(() => this.adoptTx(nodes, pk), () => this.adoptTx(nodes, pk));
+    this.adoptChain = run.catch(() => {});
+    return run;
+  }
+
+  private async adoptTx(nodes: unknown[], pk: string): Promise<string[]> {
+    if (this.stopping) return [];
+    const file = await this.loadAdopt();
+    const st: AdoptState = file.publishers[pk] ?? { n: 0, seen: [], subnets: {} };
+    const seenBefore = new Set(st.seen);
+    const tableFull = (this.dht?.nodes?.count?.() ?? 0) >= ADOPT.tableFull;
+    const inTable = new Set<string>((this.dht?.toJSON?.().nodes ?? []).map((x: any) => `${x.host}:${x.port}`));
+    const inRead = new Set<string>();
+    const admitted: string[] = [];
+    const limit = Math.min(nodes.length, ADOPT.inspect);
+    for (let i = 0; i < limit; i++) {
+      if (admitted.length >= ADOPT.perRead) break;
+      if (st.n >= ADOPT.perPublisher || this.adoptedThisSession >= ADOPT.perSession) break;
+      const n = nodes[i];
+      const e = typeof n === 'string' ? parseHostPort(n) : undefined;
+      if (!e || !usable(e) || e.family !== 4) continue;
+      if (!this.opts.allowPrivate && isPrivateHost(e.host)) continue;
+      const s = formatHostPort(e);
+      if (inRead.has(s) || inTable.has(s) || seenBefore.has(s)) continue;
+      inRead.add(s);
+      const sub = subnetKey(e.host);
+      if ((st.subnets[sub] ?? 0) >= ADOPT.perSubnetPerPublisher) continue;
+      if (tableFull && this.adopted.has(s)) continue;
+      st.n++; st.seen.push(s); st.subnets[sub] = (st.subnets[sub] ?? 0) + 1; this.adoptedThisSession++;
+      this.adopted.set(s, Date.now());
+      admitted.push(s);
+    }
+    if (admitted.length) {
+      file.publishers[pk] = st;
+      file.adopted = Object.fromEntries(this.adopted);
+      await this.writeJson('dht-adopt.json', file);
+      if (this.stopping || !this.dht || this.dht.destroyed) return admitted;
+      for (const s of admitted) { const a = parseHostPort(s)!; this.dht.addNode({ host: a.host, port: a.port }); }
+    }
+    return admitted;
   }
 
   /**
@@ -359,11 +605,12 @@ export class WebwayNode {
    * same key share one underlying load; each caller still leaves at its own
    * deadline, and the load is cancelled only once no caller is waiting.
    */
-  async catalogFull(pk: string, deadlineMs?: number): Promise<Catalog> {
-    const empty: Catalog = { entries: [], endorse: [] };
+  async catalogFull(rawPk: string, deadlineMs?: number): Promise<Catalog> {
+    const empty = emptyCatalog();
     const budget = Math.max(0, deadlineMs ?? this.opts.catalogTimeoutMs ?? 20_000);
     const deadline = Date.now() + budget;
-    if (!/^[0-9a-f]{64}$/.test(pk)) return empty;
+    const pk = canonPk(rawPk);
+    if (!pk) return empty;
     let v: any;
     try { v = await withDeadline(this.get(pk, 'catalog'), deadline, 'catalog record lookup'); } catch (e) { debug(`catalog ${pk.slice(0, 8)}: lookup failed: ${(e as Error).message}`); return empty; }
     if (!v || !(v.ih instanceof Uint8Array)) { debug(`catalog ${pk.slice(0, 8)}: no record`); return empty; }
@@ -534,9 +781,11 @@ export class WebwayNode {
       await waitFor(tor, () => tor.done, 'done', signal);
       // 3. locate catalog.json through the torrent's own file manifest, never a directory listing
       const file = tor.files.find((f: { path: string; name: string }) => f.name === 'catalog.json');
-      const cat: Catalog = file ? parseCatalog(await readFile(join(tor.path, file.path), { encoding: 'utf8', signal }), pk) : { entries: [], endorse: [] };
+      const cat: Catalog = file ? parseCatalog(await readFile(join(tor.path, file.path), { encoding: 'utf8', signal }), pk) : emptyCatalog();
       // 4. this is now pk's current catalog torrent; the previous one is retired off the critical path
       this.retain(pk, ref);
+      // 5. bootstrap hints (#4): rationed adoption; a failure here never spoils the catalog itself
+      if (cat.nodes?.length) await this.adoptNodes(cat.nodes, pk).catch((e) => { this.lifecycleErrors.push(e instanceof Error ? e : new Error(String(e))); });
       const max = this.opts.catalogCacheMax ?? 200;
       if (max > 0) {
         this.catalogCache.set(key, cat);
@@ -613,8 +862,8 @@ export function checkInt(name: string, v: unknown, max: number): number {
 /** Validate an untrusted catalog.json body; bad entries are dropped, good ones kept. */
 export function parseCatalog(text: string, pk: string): Catalog {
   let j: any;
-  try { j = JSON.parse(text); } catch { return { entries: [], endorse: [] }; }
-  if (!j || typeof j !== 'object' || Array.isArray(j)) return { entries: [], endorse: [] };
+  try { j = JSON.parse(text); } catch { return emptyCatalog(); }
+  if (!j || typeof j !== 'object' || Array.isArray(j)) return emptyCatalog();
   const entries: CatalogEntry[] = [];
   if (Array.isArray(j.entries)) {
     for (const e of j.entries) {
@@ -640,7 +889,15 @@ export function parseCatalog(text: string, pk: string): Catalog {
       set.add(k); endorse.push(k);
     }
   }
-  return { entries, endorse };
+  // nodes: pass through at most ADOPT.inspect raw string entries (short ones); adoptNodes() does the real validation + rationing.
+  const nodes: string[] = [];
+  if (Array.isArray(j.nodes)) {
+    for (const x of j.nodes) {
+      if (nodes.length >= ADOPT.inspect) break;
+      if (typeof x === 'string' && x.length <= 64) nodes.push(x);
+    }
+  }
+  return nodes.length ? { entries, endorse, nodes } : { entries, endorse };
 }
 
 function debug(msg: string): void {
