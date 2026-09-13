@@ -68,6 +68,7 @@ Needs Node 22+.
 ```
 webway id                          your publisher key
 webway share <dir> --name <n>      seed + sign name into DHT + update your catalog
+webway import <hf://org/model>     download a HuggingFace repo, then share + sign it
 webway get <ref>                   download and keep seeding (webway://, magnet, or infohash)
 webway serve                       reseed everything you hold, keep names alive
 webway resolve <ref>               what a name points at right now
@@ -134,6 +135,32 @@ accounting is not locked across processes (issue #10).
 **IPv6:** endpoints like `[2001:db8::1]:6881` are parsed but dropped from every
 list. The installed DHT stack splits `host:port` on `:` and listens on a udp4
 socket, so they cannot work yet; accepting them would only hide that.
+## Import from HuggingFace
+
+```
+webway import hf://meta-llama/Llama-3.1-8B           # HF_TOKEN=... for gated repos
+webway import org/model --revision v2 --license mit  # override the card's license
+```
+
+Pins the commit the API reports and downloads every file at that commit
+(except `.gitattributes`) into an immutable version dir,
+`~/.webway/versions/org/model/<commit>/`, verifying sizes and LFS sha256s,
+resuming partial files with validated Range requests, and bounding file counts,
+path depth, per-file and total bytes, stalls, and oversized streams. Only when
+every file has verified is the version promoted: it is seeded and
+`webway://<your-key>/org/model` is signed into the DHT, then `current.json` is
+written (the commit point) and `~/.webway/models/org/model` is repointed at the
+new version, and only then is the previous version retired. Nothing is ever
+renamed over the published path, and no directory a live torrent is reading
+from is ever deleted; a crash at any step leaves either the old or the new
+version fully consistent, and the next start reconciles under the per-repo
+lock (a journaled but unfinished promotion is completed when its share record
+and content exist, otherwise its local record is dropped; a DHT name record
+that was already put simply expires on its own after ~2h, nothing can
+unpublish it). A per-repo lock (heartbeated directory; reclaimed only when the
+holder is provably dead) refuses concurrent imports of the same model. The license from the model
+card travels in the signed record. `HF_TOKEN` is only ever sent to
+`huggingface.co`.
 
 ## Dev
 

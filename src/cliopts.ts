@@ -9,7 +9,11 @@ export function parse(argv: string[]) {
     const a = argv[i];
     if (a.startsWith('--')) {
       const k = a.slice(2);
-      (flags[k] ??= []).push(BOOLEAN_FLAGS.has(k) ? 'true' : argv[++i] ?? 'true');
+      if (!k) throw new Error(`bad flag: ${a}`);
+      if (BOOLEAN_FLAGS.has(k)) { (flags[k] ??= []).push('true'); continue; }
+      const v = argv[i + 1];
+      if (v === undefined || v.startsWith('--')) throw new Error(`missing value for --${k}`);
+      (flags[k] ??= []).push(v); i++;
     } else args.push(a);
   }
   return { args, flags };

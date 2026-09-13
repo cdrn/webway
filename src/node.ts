@@ -7,6 +7,8 @@ import { join, basename, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { loadOrCreate, sign, verify, type Keypair } from './keys.ts';
 import { DNS_SEED_DOMAINS, LIMITS, advertisableNodes, canonicalEndpoints, dnsSeeds, formatHostPort, isPrivateHost, mergeBootstrap, ownedResolver, parseHostPort, startupPeerPings, subnetKey, usable, type CancellableResolver, type TxtResolver } from './bootstrap.ts';
+import { pruneVersions, readPointer, recoverVersions, versionsRoot, withRepoLock, type Recovery } from './versions.ts';
+import { resolve as resolvePath, sep } from 'node:path';
 
 /**
  * A webway node = a BitTorrent client + a Mainline DHT node + a publisher key.
@@ -42,6 +44,11 @@ export interface SearchOpts { depth?: number; maxPublishers?: number }
 /** Lifecycle record for one catalog torrent (one per infohash). */
 interface TorrentRef { ih: string; torrent: Torrent; owned: boolean; dir?: string; readers: number; retainedBy: Set<string>; lastUse: number }
 export interface Share { name: string; ih: string; dir: string; size: number; license?: string; own: boolean }
+export interface ShareOpts {
+  torrentName?: string;   // torrent name (default: basename(dir))
+  dir?: string;           // what to persist as the share's dir (default: dir); serve() re-adds from dirname(dir)
+  keepPrevious?: boolean; // leave the torrent that previously backed this name running (caller retires it)
+}
 
 export interface NodeOpts {
   home?: string;
@@ -110,6 +117,20 @@ export function sanitizeAdoptFile(raw: unknown): AdoptFile {
   return out;
 }
 
+/** DHT salt limit (BEP44) bounds the name; the record itself must stay well under 1000 bytes. */
+export const MAX_NAME_BYTES = 64;
+export const MAX_LICENSE_BYTES = 64;
+
+/** Fail fast on anything the DHT record could not carry. Safe to call before any download. */
+export function assertPublishable(name: string, license?: string): void {
+  if (!name || Buffer.byteLength(name) > MAX_NAME_BYTES) throw new Error(`name must be 1..${MAX_NAME_BYTES} bytes (DHT salt limit): ${name.length > 80 ? name.slice(0, 80) + '…' : name}`);
+  if (/[\x00-\x1f\x7f-\x9f]/.test(name)) throw new Error('name contains control characters');
+  if (license !== undefined) {
+    if (Buffer.byteLength(license) > MAX_LICENSE_BYTES) throw new Error(`license must be at most ${MAX_LICENSE_BYTES} bytes`);
+    if (/[\x00-\x1f\x7f-\x9f]/.test(license)) throw new Error('license contains control characters');
+  }
+}
+
 /** Where a torrent's files landed: multi-file torrents nest under t.name, single-file ones don't. */
 function torrentRoot(t: Torrent, path: string): string {
   return t.files.every((f: { path: string }) => f.path.startsWith(t.name + '/')) ? join(path, t.name) : path;
@@ -140,6 +161,9 @@ export class WebwayNode {
   private adopted = new Map<string, number>();
   private adoptedThisSession = 0;
   private adoptChain: Promise<unknown> = Promise.resolve();
+  /** infohash -> directories currently backing a live torrent for it (seed/serve/fetch/import). */
+  private backing = new Map<string, Set<string>>();
+  private sharesTxn: Promise<unknown> = Promise.resolve();
 
   constructor(opts: NodeOpts = {}) {
     if (opts.catalogTimeoutMs !== undefined) checkInt('catalogTimeoutMs', opts.catalogTimeoutMs, WebwayNode.CATALOG_TIMEOUT_MAX_MS);
@@ -157,6 +181,7 @@ export class WebwayNode {
   async start(): Promise<this> {
     await mkdir(this.modelsDir(), { recursive: true });
     this.key = await loadOrCreate(join(this.home, 'key.json'));
+    await this.recoverImports();
     const saved = await this.readJson<{ nodes?: any[] }>('dht.json', {});
     // Bootstrap set = builtin routers + nodes we knew last session + DNS TXT seeds + anything passed on the CLI.
     // (k-rpc treats a non-empty `nodes` as a replacement for `bootstrap`, so we merge by hand.)
@@ -171,7 +196,7 @@ export class WebwayNode {
     // Restore adoption provenance before anything can publish a catalog.
     const adoptFile = sanitizeAdoptFile(await this.readJson<unknown>('dht-adopt.json', {}));
     for (const [addr, t] of Object.entries(adoptFile.adopted)) this.adopted.set(addr, t);
-    this.client = new WebTorrent({
+    const clientOpts = {
       torrentPort: this.opts.torrentPort ?? 0,
       dhtPort: this.opts.dhtPort ?? 0,
       dht: { verify, bootstrap },
@@ -179,8 +204,18 @@ export class WebwayNode {
       natPmp: this.opts.nat ?? true,
       tracker: false, // DHT + PEX only; nothing to subpoena
       lsd: true, // BEP14: find peers on the LAN with no DHT at all
-    } as any);
-    await new Promise<void>((r) => this.dht.once('listening', r));
+    };
+    // webtorrent binds uTP (UDP) on whatever port the kernel gave its TCP server; when that UDP
+    // port is already taken the client dies with EADDRINUSE. Bounded retry with a fresh client
+    // (only when the ports were kernel-assigned; an explicit port collision is the user's to fix).
+    for (let attempt = 1; ; attempt++) {
+      this.client = new WebTorrent(clientOpts as any);
+      try { await this.waitListening(); break; }
+      catch (e: any) {
+        await new Promise<void>((r) => this.client.destroy(() => r()));
+        if (e?.code !== 'EADDRINUSE' || attempt >= 5 || this.opts.torrentPort || this.opts.dhtPort) throw e;
+      }
+    }
     // Immediate pings only for --peer values that survived the merged, capped list (never the raw array).
     this.startupPeers = startupPeerPings(bootstrap, peers);
     for (const p of this.startupPeers) { const a = parseHostPort(p); if (a) this.dht.addNode({ host: a.host, port: a.port }); }
@@ -279,6 +314,19 @@ export class WebwayNode {
     if (this.wasPopulated) { this.wasPopulated = false; this.armDiscovery(); this.scheduleDnsRetry(); }
   }
 
+  /** Resolve once both the DHT socket and the torrent (TCP + uTP) server are listening; reject on a startup error. */
+  private waitListening(): Promise<void> {
+    const c: any = this.client;
+    return new Promise<void>((resolve, reject) => {
+      let dhtUp = false, torrentUp = false;
+      const done = () => { if (dhtUp && torrentUp) { c.removeListener('error', onErr); resolve(); } };
+      const onErr = (e: any) => reject(e);
+      c.once('error', onErr);
+      c.dht.once('listening', () => { dhtUp = true; done(); });
+      if (c.listening) { torrentUp = true; done(); } else c.once('listening', () => { torrentUp = true; done(); });
+    });
+  }
+
   async stop(): Promise<void> {
     this.stopping = true; // set before any await: nothing is admitted while we wind down
     for (const t of this.timers) clearInterval(t);
@@ -298,10 +346,59 @@ export class WebwayNode {
   /** Atomic + serialised per path (see atomic.ts); a crash never leaves truncated JSON. */
   private writeJson(f: string, v: unknown) { return atomicWriteJson(this.home, f, v); }
   shares() { return this.readJson<Share[]>('shares.json', []); }
-  private async upsertShare(s: Share) {
-    const all = (await this.shares()).filter((x) => x.ih !== s.ih);
-    all.push(s);
-    await this.writeJson('shares.json', all);
+  /** All shares.json writes go through one serialised, atomic (tmp+rename) transaction chain. */
+  private mutateShares(fn: (all: Share[]) => Share[]): Promise<Share[]> {
+    const run = async () => { const next = fn(await this.shares()); await atomicWriteJson(this.home, 'shares.json', next); return next; };
+    const p = this.sharesTxn.then(run, run);
+    this.sharesTxn = p.catch(() => {});
+    return p;
+  }
+  /** Own shares are keyed by name (one name -> one version); held shares are keyed by (name, ih). */
+  private upsertShare(s: Share) {
+    const clean: Share = { name: s.name, ih: s.ih, dir: s.dir, size: s.size, license: s.license, own: s.own };
+    return this.mutateShares((all) => [...all.filter((x) => s.own ? !(x.own && x.name === s.name) : !(!x.own && x.name === s.name && x.ih === s.ih)), clean]);
+  }
+  /** Remove just the own record for `name`, restoring `previous` in its place if given. */
+  private restoreOwn(name: string, previous?: Share) {
+    return this.mutateShares((all) => { const rest = all.filter((x) => !(x.own && x.name === name)); if (previous) rest.push(previous); return rest; });
+  }
+
+  // ---- backing dirs (what a live torrent reads from) -----------------------
+  private track(ih: string, dir: string) { let set = this.backing.get(ih); if (!set) this.backing.set(ih, (set = new Set())); set.add(resolvePath(dir)); }
+  private untrack(ih: string) { this.backing.delete(ih); }
+  /** True when a live torrent in this process is reading from `dir`. Never delete such a dir. */
+  isBacking(dir: string): boolean {
+    const d = resolvePath(dir);
+    for (const set of this.backing.values()) if (set.has(d)) return true;
+    for (const ref of this.refs.values()) if (ref.dir && !(ref.torrent as any).destroyed && resolvePath(ref.dir) === d) return true;
+    return false;
+  }
+  backingDirs(ih: string): string[] { return [...(this.backing.get(ih) ?? [])]; }
+
+  /**
+   * Reconcile versioned imports (see versions.ts) on start or on demand: each repo is handled
+   * under its own lock (repos with a live importer are skipped), `current.json` is the truth,
+   * a journaled pending promotion is completed or its share record dropped, and nothing that
+   * is current, in progress, pending, or backing a live torrent is ever pruned.
+   */
+  async recoverImports(): Promise<Recovery> {
+    const r = await recoverVersions(this.home, { isLive: (d) => this.isBacking(d), shares: await this.shares() });
+    for (const name of r.remove) await this.restoreOwn(name);
+    for (const s of r.restore) {
+      await this.upsertShare(s);
+      // A torrent of ours still reading a non-current version of this repo (only possible when
+      // recovery runs inside a live process) is retired, then the repo is pruned again.
+      const root = versionsRoot(this.home, s.name) + sep;
+      for (const t of [...this.client.torrents]) {
+        if (t.infoHash === s.ih) continue;
+        if (this.backingDirs(t.infoHash).some((d) => d.startsWith(root))) await this.destroyOwnTorrent(t.infoHash);
+      }
+      await withRepoLock(this.home, s.name, async () => {
+        const ptr = await readPointer(this.home, s.name);
+        if (ptr) await pruneVersions(this.home, s.name, { keep: new Set([ptr.version]), isLive: (d) => this.isBacking(d) });
+      }).catch(() => {});
+    }
+    return r;
   }
   follows() { return this.readJson<string[]>('follows.json', []); }
   async follow(pk: string) {
@@ -313,29 +410,102 @@ export class WebwayNode {
 
   // ---- seeding -----------------------------------------------------------
 
-  /** Seed a directory. Returns the torrent once it is ready to serve. */
-  seed(dir: string, name: string): Promise<Torrent> {
+  /** Seed a directory under a torrent name (default: the directory's basename). Returns the torrent once ready. */
+  seed(dir: string, o: { torrentName?: string } | string = {}): Promise<Torrent> {
+    // The torrent name defaults to the directory's basename (what the catalog lifecycle relies
+    // on: distinct catalog dirs must yield distinct on-disk paths under one publisher's cache).
+    // Imports pass { torrentName } because their version dirs are named by commit.
+    const torrentName = (typeof o === 'object' && o.torrentName) || basename(dir);
     return new Promise((resolve, reject) => {
-      const t = this.client.seed(dir, { name: basename(dir), announce: [], private: false } as any, (t: Torrent) => resolve(t));
+      const before = new Set(this.client.torrents);
+      const t = this.client.seed(dir, { name: torrentName, announce: [], private: false } as any, (t: Torrent) => {
+        // webtorrent hands back the existing instance for a known infohash; that one keeps its own backing dir.
+        if (!before.has(t)) this.track(t.infoHash, dir);
+        resolve(t);
+      });
       t.once('error', reject);
     });
   }
 
-  /** Share a directory under your own key: seed it, sign its name into the DHT, update your catalog. */
-  async share(dir: string, name: string, license?: string): Promise<Share> {
-    const t = await this.seed(dir, name);
-    const share: Share = { name, ih: t.infoHash, dir, size: t.length, license, own: true };
-    await this.upsertShare(share);
-    await this.publishName(share);
-    await this.publishCatalog();
+  /**
+   * Share a directory under your own key: seed it, persist the share, sign its name into the
+   * DHT (that is the commit point), then best-effort publish the catalog and (unless
+   * keepPrevious) retire the torrent that previously backed this name.
+   *
+   * Ordering is what makes failure coherent: the previous torrent keeps seeding until the new
+   * seed AND the DHT publish have both succeeded; the share record is persisted before the
+   * publish and only that record is rolled back if the publish fails; a torrent that already
+   * existed before this call (webtorrent returns the existing instance for a known infohash)
+   * is never destroyed. A catalog failure after the name is published is returned as
+   * `warning` and never thrown: the share is committed at that point.
+   */
+  async share(dir: string, name: string, license?: string, o: ShareOpts = {}): Promise<Share & { warning?: string }> {
+    const share = await this.prepareShare(dir, name, license, o);
+    let warning: string | undefined;
+    try { await this.publishCatalog(); } catch (e: any) { warning = `catalog publish failed (will retry on serve): ${e?.message ?? e}`; }
+    return warning ? { ...share, warning } : share;
+  }
+
+  /** seed + persist + publishName. Throws only before anything is committed. */
+  async prepareShare(dir: string, name: string, license?: string, o: ShareOpts = {}): Promise<Share> {
+    assertPublishable(name, license);
+    const before = new Set(this.client.torrents);
+    const t = await this.seed(dir, { torrentName: o.torrentName });
+    const ownedByUs = !before.has(t);
+    const prev = (await this.shares()).find((s) => s.own && s.name === name);
+    const share: Share = { name, ih: t.infoHash, dir: o.dir ?? dir, size: t.length, license, own: true };
+    let committed = false;
+    try {
+      await this.upsertShare(share);
+      await this.publishName(share);
+      committed = true;
+    } finally {
+      if (!committed) {
+        try { await this.restoreOwn(name, prev); }
+        finally { if (ownedByUs && !(prev && prev.ih === t.infoHash)) await this.destroyOwnTorrent(t.infoHash); }
+      }
+    }
+    if (!o.keepPrevious && prev && prev.ih !== t.infoHash) await this.stopTorrent(prev.ih, name);
     return share;
+  }
+
+  /**
+   * Undo a share() the caller has not committed: restore the previous record, drop the new
+   * torrent, and make sure the abandoned name is not re-put by us (the DHT record itself
+   * expires on its own, ~2h; nothing can unpublish it).
+   */
+  async unshare(s: Share, previous?: Share): Promise<void> {
+    await this.restoreOwn(s.name, previous);
+    const held = await this.held();
+    if (delete held[`${this.pk}/${s.name}`]) await this.writeJson('records.json', held);
+    if (!previous || previous.ih !== s.ih) await this.stopTorrent(s.ih, s.name);
+  }
+
+  /** Destroy one of OUR seeded torrents by infohash and forget its backing dirs (catalog torrents use the ref lifecycle below). */
+  private async destroyOwnTorrent(ih: string): Promise<void> {
+    const t = await (this.client as any).get(ih);
+    if (t) await new Promise<void>((r) => t.destroy({}, () => r()));
+    this.untrack(ih);
+  }
+
+  /** Destroy the torrent for `ih` unless another own share (other than `exceptName`) still needs it. */
+  async stopTorrent(ih: string, exceptName?: string): Promise<void> {
+    const stillUsed = (await this.shares()).some((s) => s.own && s.ih === ih && s.name !== exceptName);
+    if (stillUsed) return;
+    await this.destroyOwnTorrent(ih);
+  }
+
+  /** Stop seeding whatever currently backs our own share `name` (keeps shares.json until a replacement is written). */
+  async stopSharing(name: string): Promise<void> {
+    const prev = (await this.shares()).find((s) => s.own && s.name === name);
+    if (prev) await this.stopTorrent(prev.ih, name);
   }
 
   /** Reseed everything we hold and re-put our names (BEP44 items expire after ~2h). */
   async serve(): Promise<Share[]> {
     const shares = await this.shares();
     for (const s of shares) {
-      await new Promise<void>((r) => { const t = this.client.add(s.ih, { path: join(s.dir, '..'), announce: [] } as any, () => r()); t.once('error', () => r()); });
+      await new Promise<void>((r) => { const t = this.client.add(s.ih, { path: join(s.dir, '..'), announce: [] } as any, () => { this.track(s.ih, s.dir); r(); }); t.once('error', () => r()); });
     }
     await this.republish();
     const t = setInterval(() => void this.republish().catch(() => {}), 50 * 60_000);
@@ -478,7 +648,7 @@ export class WebwayNode {
     const t = await new Promise<Torrent>((resolve, reject) => {
       const t = this.client.add(r.ih, { path, announce: [] } as any);
       t.once('error', reject);
-      t.once('done', () => resolve(t));
+      t.once('done', () => { this.track(t.infoHash, torrentRoot(t, path)); resolve(t); });
       if (onProgress) { const i = setInterval(() => onProgress(t), 1000); t.once('done', () => clearInterval(i)); t.once('error', () => clearInterval(i)); }
     });
     const share: Share = { name: r.name, ih: t.infoHash, dir: torrentRoot(t, path), size: t.length, license: r.license, own: false };
