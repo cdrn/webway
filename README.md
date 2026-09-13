@@ -1,5 +1,7 @@
 # webway
 
+*unstoppable intelligence*
+
 Napster for model weights, minus the part that got Napster shut down.
 
 Napster had one index server. Subpoena it and the network dies. webway has no
