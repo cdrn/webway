@@ -25,6 +25,7 @@
     "bencode": "^4.0.0",
     "bittorrent-dht": "^11.0.12",
     "create-torrent": "^6.1.3",
+    "viem": "^2.56.3",
     "webtorrent": "^3.0.21"
   }
 }

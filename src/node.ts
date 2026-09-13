@@ -9,6 +9,10 @@ import { loadOrCreate, sign, verify, type Keypair } from './keys.ts';
 import { DNS_SEED_DOMAINS, LIMITS, advertisableNodes, canonicalEndpoints, dnsSeeds, formatHostPort, isPrivateHost, mergeBootstrap, ownedResolver, parseHostPort, startupPeerPings, subnetKey, usable, type CancellableResolver, type TxtResolver } from './bootstrap.ts';
 import { pruneVersions, readPointer, recoverVersions, versionsRoot, withRepoLock, type Recovery } from './versions.ts';
 import { resolve as resolvePath, sep } from 'node:path';
+import { getAddress } from 'viem';
+import { MAX_U64, type ChainRegistry, type Owner as Hint } from './chain.ts';
+
+export const MAX_DHT_SEQ = BigInt(Number.MAX_SAFE_INTEGER);
 
 /**
  * A webway node = a BitTorrent client + a Mainline DHT node + a publisher key.
@@ -45,6 +49,7 @@ export interface SearchOpts { depth?: number; maxPublishers?: number }
 interface TorrentRef { ih: string; torrent: Torrent; owned: boolean; dir?: string; readers: number; retainedBy: Set<string>; lastUse: number }
 export interface Share { name: string; ih: string; dir: string; size: number; license?: string; own: boolean }
 export interface ShareOpts {
+  ethKey?: string;        // also publish the same version to the on-chain registry (WEBWAY_ETH_KEY)
   torrentName?: string;   // torrent name (default: basename(dir))
   dir?: string;           // what to persist as the share's dir (default: dir); serve() re-adds from dirname(dir)
   keepPrevious?: boolean; // leave the torrent that previously backed this name running (caller retires it)
@@ -57,6 +62,7 @@ export interface NodeOpts {
   dhtPort?: number;
   peers?: string[]; // extra DHT nodes host:port
   nat?: boolean; // UPnP/NAT-PMP port mapping (default on)
+  chain?: ChainRegistry | false; // on-chain registry as a second resolution path (issue #9)
   catalogTimeoutMs?: number; // per-publisher catalog fetch deadline (default 20s)
   searchTimeoutMs?: number; // overall search deadline (default 120s)
   catalogCacheMax?: number; // in-memory parsed-catalog cache entries (default 200; 0 = no cache)
@@ -129,6 +135,67 @@ export function assertPublishable(name: string, license?: string): void {
     if (Buffer.byteLength(license) > MAX_LICENSE_BYTES) throw new Error(`license must be at most ${MAX_LICENSE_BYTES} bytes`);
     if (/[\x00-\x1f\x7f-\x9f]/.test(license)) throw new Error('license contains control characters');
   }
+}
+
+export interface Resolved {
+  ih: string; name: string; size?: number; license?: string; pk?: string;
+  seq?: bigint; source?: 'dht' | 'chain' | 'ref'; warning?: string;
+  /** The chain snapshot consulted (present whenever the registry answered, even with no record). */
+  snapshot?: { height: bigint; hash: `0x${string}` };
+}
+
+export interface DhtRecord { ih: string; size: number; license?: string; hint?: Hint }
+
+/**
+ * Validate a DHT name payload: exactly what publishName() writes, for the name
+ * we asked for. `a`/`e` (the publisher's on-chain account + binding epoch,
+ * `e` as a decimal string) are an optional cross-check against ownerOf(pk):
+ * a mismatch is reported as a warning, never used as authority.
+ */
+export function parseDhtRecord(v: unknown, expectName: string): DhtRecord | null {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
+  const o = v as Record<string, unknown>;
+  const ih = o.ih instanceof Uint8Array ? Buffer.from(o.ih) : null;
+  if (!ih || ih.length !== 20) return null;
+  const n = o.n instanceof Uint8Array ? Buffer.from(o.n).toString('utf8') : typeof o.n === 'string' ? o.n : null;
+  if (n !== expectName) return null;
+  const sz = typeof o.sz === 'number' ? o.sz : typeof o.sz === 'bigint' ? Number(o.sz) : NaN;
+  if (!Number.isSafeInteger(sz) || sz < 0) return null;
+  let license: string | undefined;
+  if (o.l !== undefined) {
+    if (o.l instanceof Uint8Array) license = Buffer.from(o.l).toString('utf8');
+    else if (typeof o.l === 'string') license = o.l;
+    else return null;
+  }
+  let hint: Hint | undefined;
+  if (o.a !== undefined || o.e !== undefined) {
+    const a = o.a instanceof Uint8Array ? Buffer.from(o.a) : null;
+    if (!a || a.length !== 20) return null;
+    const es = o.e instanceof Uint8Array ? Buffer.from(o.e).toString('utf8') : typeof o.e === 'string' ? o.e : null;
+    if (es === null || !/^(0|[1-9]\d{0,19})$/.test(es)) return null;
+    const e = BigInt(es);
+    if (e > MAX_U64) return null;
+    hint = { addr: getAddress(`0x${a.toString('hex')}`), epoch: e };
+  }
+  return { ih: ih.toString('hex'), size: sz, license: license || undefined, hint };
+}
+
+/**
+ * "host:port" for a chain-advertised bootstrap node: canonical public IPv4
+ * literal only (no hostnames, so nothing resolves to private space behind our
+ * back; matches the rule branch #4 adopted), port 1-65535.
+ */
+export function validPublicNode(s: string, allowPrivate = false): { host: string; port: number } | null {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3}):(\d{1,5})$/.exec(s);
+  if (!m) return null;
+  const oct = m.slice(1, 5);
+  if (oct.some((x) => (x.length > 1 && x.startsWith('0')) || Number(x) > 255)) return null; // canonical: no leading zeros
+  const port = m[5];
+  if ((port.length > 1 && port.startsWith('0')) || Number(port) < 1 || Number(port) > 65535) return null;
+  const [a, b] = [Number(oct[0]), Number(oct[1])];
+  const priv = a === 10 || a === 127 || a === 0 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254) || (a === 100 && b >= 64 && b <= 127) || (a === 192 && b === 0 && Number(oct[2]) === 0) || a >= 224;
+  if (priv && !allowPrivate) return null;
+  return { host: oct.join('.'), port: Number(port) };
 }
 
 /** Where a torrent's files landed: multi-file torrents nest under t.name, single-file ones don't. */
@@ -255,6 +322,8 @@ export class WebwayNode {
     const persist = () => { this.checkIsolation(); this.writeJson('dht.json', { nodes: this.dht.toJSON().nodes }).catch(() => {}); };
     this.timers.push(setInterval(persist, 60_000));
     this.timers[0].unref();
+    // On-chain bootstrap runs in the background; await node.chainBootstrapReady if you need it.
+    this.chainBootstrapReady = this.bootstrapFromChain().catch(() => [] as string[]);
     return this;
   }
 
@@ -326,6 +395,48 @@ export class WebwayNode {
       if (c.listening) { torrentUp = true; done(); } else c.once('listening', () => { torrentUp = true; done(); });
     });
   }
+
+  /** Resolves when the start-time on-chain bootstrap has finished (never rejects). */
+  chainBootstrapReady: Promise<string[]> = Promise.resolve([]);
+  private chainBootstrapped = new Set<string>();
+
+  /**
+   * On-chain bootstrap (#9/#10): for each publisher (default: everyone we
+   * follow), add the DHT nodes advertised by its bound account. A publisher is
+   * marked done only after its reads succeed, so a transient RPC failure is
+   * retried on the next follow()/resolve()/session. ≤20 distinct destinations.
+   */
+  async bootstrapFromChain(pks?: string[]): Promise<string[]> {
+    const added: string[] = [];
+    if (!this.chain) return added;
+    const targets = (pks ?? await this.follows()).filter((pk) => !this.chainBootstrapped.has(pk));
+    if (!targets.length) return added;
+    for (const pk of targets) {
+      let nodes: string[];
+      try {
+        const o = await this.chain.ownerOf(pk);
+        nodes = o ? await this.chain.nodesOf(o.addr) : [];
+      } catch { continue; } // not marked: try again later
+      this.chainBootstrapped.add(pk);
+      const seen = new Set<string>();
+      for (const s of nodes) {
+        if (seen.size >= 20) break;
+        const v = validPublicNode(s, this.opts.allowPrivate);
+        if (!v) continue;
+        const key = `${v.host}:${v.port}`;
+        if (seen.has(key)) continue;
+        seen.add(key); this.dht.addNode(v); added.push(key);
+      }
+    }
+    return added;
+  }
+
+  /** Fire-and-forget bootstrap for one publisher (follow(), resolve()). */
+  private kickBootstrap(pk: string) {
+    if (!this.chain || this.chainBootstrapped.has(pk)) return;
+    void this.bootstrapFromChain([pk]).catch(() => {});
+  }
+
 
   async stop(): Promise<void> {
     this.stopping = true; // set before any await: nothing is admitted while we wind down
@@ -406,6 +517,26 @@ export class WebwayNode {
     if (!c) throw new Error('publisher key must be 64 hex chars');
     const f = new Set(await this.follows()); f.add(c);
     await this.writeJson('follows.json', [...f]);
+    this.kickBootstrap(pk);
+  }
+
+  /** Our own on-chain binding (account + epoch) as of our last bindChain(); carried in our DHT records as a cross-check. */
+  ownBinding() { return this.readJson<{ addr: string; epoch: string } | null>('chainbind.json', null).then((b) => (b ? { addr: getAddress(b.addr), epoch: BigInt(b.epoch) } as Hint : null)); }
+
+  /**
+   * Bind our publisher key to the account behind ethKey; the contract verifies
+   * the ed25519 signature. Epoch defaults to (current on-chain epoch + 1), or 0
+   * for a first binding.
+   */
+  async bindChain(ethKey: string, epoch?: bigint): Promise<Hint & { tx: string }> {
+    if (!this.chain) throw new Error('no registry configured');
+    const cur = await this.chain.latestOwner(this.pk);
+    const e = epoch ?? (cur ? cur.epoch + 1n : 0n);
+    if (typeof e !== 'bigint' || e < 0n || e > MAX_U64) throw new Error('epoch out of range');
+    const tx = await this.chain.bind(ethKey, this.key, e);
+    const addr = this.chain.addressOf(ethKey);
+    await this.writeJson('chainbind.json', { addr, epoch: e.toString() });
+    return { addr, epoch: e, tx };
   }
 
   // ---- seeding -----------------------------------------------------------
@@ -430,7 +561,9 @@ export class WebwayNode {
   /**
    * Share a directory under your own key: seed it, persist the share, sign its name into the
    * DHT (that is the commit point), then best-effort publish the catalog and (unless
-   * keepPrevious) retire the torrent that previously backed this name.
+   * keepPrevious) retire the torrent that previously backed this name. With `ethKey` the same
+   * version is also published to the on-chain registry (one version per update, allocated once
+   * by allocateVersion() for both paths).
    *
    * Ordering is what makes failure coherent: the previous torrent keeps seeding until the new
    * seed AND the DHT publish have both succeeded; the share record is persisted before the
@@ -439,25 +572,32 @@ export class WebwayNode {
    * is never destroyed. A catalog failure after the name is published is returned as
    * `warning` and never thrown: the share is committed at that point.
    */
-  async share(dir: string, name: string, license?: string, o: ShareOpts = {}): Promise<Share & { warning?: string }> {
+  async share(dir: string, name: string, license?: string, o: ShareOpts = {}): Promise<Share & { seq: bigint; chainTx?: string; warning?: string }> {
     const share = await this.prepareShare(dir, name, license, o);
     let warning: string | undefined;
     try { await this.publishCatalog(); } catch (e: any) { warning = `catalog publish failed (will retry on serve): ${e?.message ?? e}`; }
     return warning ? { ...share, warning } : share;
   }
 
-  /** seed + persist + publishName. Throws only before anything is committed. */
-  async prepareShare(dir: string, name: string, license?: string, o: ShareOpts = {}): Promise<Share> {
+  /**
+   * seed + allocate one version + persist + publishName (+ publish on chain with that same
+   * version when `ethKey` is given). Throws only before anything is committed to the DHT; a
+   * chain failure after the DHT commit propagates but does not undo the share.
+   */
+  async prepareShare(dir: string, name: string, license?: string, o: ShareOpts = {}): Promise<Share & { seq: bigint; chainTx?: string }> {
     assertPublishable(name, license);
+    if (o.ethKey && !this.chain) throw new Error('no registry configured');
     const before = new Set(this.client.torrents);
     const t = await this.seed(dir, { torrentName: o.torrentName });
     const ownedByUs = !before.has(t);
     const prev = (await this.shares()).find((s) => s.own && s.name === name);
     const share: Share = { name, ih: t.infoHash, dir: o.dir ?? dir, size: t.length, license, own: true };
     let committed = false;
+    let seq: bigint;
     try {
+      seq = await this.allocateVersion(name, o.ethKey);
       await this.upsertShare(share);
-      await this.publishName(share);
+      await this.publishName(share, seq);
       committed = true;
     } finally {
       if (!committed) {
@@ -466,7 +606,9 @@ export class WebwayNode {
       }
     }
     if (!o.keepPrevious && prev && prev.ih !== t.infoHash) await this.stopTorrent(prev.ih, name);
-    return share;
+    let chainTx: string | undefined;
+    if (o.ethKey) chainTx = (await this.publishToChain(o.ethKey, share, undefined, seq)).tx;
+    return { ...share, seq, chainTx };
   }
 
   /**
@@ -569,17 +711,88 @@ export class WebwayNode {
   // ---- names (BEP44) -----------------------------------------------------
 
   private seqPath() { return 'seq.json'; }
-  private async nextSeq(salt: string): Promise<number> {
-    const seqs = await this.readJson<Record<string, number>>(this.seqPath(), {});
-    const n = Math.max((seqs[salt] ?? 0) + 1, Math.floor(Date.now() / 1000));
-    seqs[salt] = n;
-    await this.writeJson(this.seqPath(), seqs);
-    return n;
+  /**
+   * One version allocator for both the DHT and the chain: persisted per name,
+   * strictly increasing, never below now() or below `floor`. Computed in
+   * bigint. A DHT-published name (the default) can never exceed 2^53-1 (BEP44
+   * seq must survive JSON/JS numbers); the check happens BEFORE anything is
+   * persisted, so a bad floor cannot poison the counter. `chainOnly` names may
+   * go to uint64 max.
+   */
+  private seqChain: Promise<unknown> = Promise.resolve();
+  nextSeq(salt: string, floor = 0n, opts: { chainOnly?: boolean } = {}): Promise<bigint> {
+    const run = async () => {
+      if (typeof floor !== 'bigint' || floor < 0n) throw new Error('seq floor must be a non-negative bigint');
+      const seqs = await this.readJson<Record<string, string | number>>(this.seqPath(), {});
+      const rawPrev = seqs[salt];
+      let prev = 0n;
+      if (rawPrev !== undefined) {
+        if (typeof rawPrev === 'number' && Number.isSafeInteger(rawPrev) && rawPrev >= 0) prev = BigInt(rawPrev);
+        else if (typeof rawPrev === 'string' && /^\d+$/.test(rawPrev)) prev = BigInt(rawPrev);
+        else throw new Error(`corrupt seq.json entry for ${salt}`);
+      }
+      const now = BigInt(Math.floor(Date.now() / 1000));
+      let n = prev + 1n;
+      if (now > n) n = now;
+      if (floor + 1n > n) n = floor + 1n;
+      const cap = opts.chainOnly ? MAX_U64 : MAX_DHT_SEQ;
+      if (n > cap) throw new Error(`cannot allocate version ${n} for ${salt}: exceeds ${opts.chainOnly ? 'uint64' : 'the DHT-safe maximum 2^53-1'}`);
+      seqs[salt] = n.toString();
+      await this.writeJson(this.seqPath(), seqs);
+      return n;
+    };
+    const p = this.seqChain.then(run, run);
+    this.seqChain = p.catch(() => {});
+    return p;
   }
 
-  private put(salt: string, v: unknown, seq: number): Promise<Buffer> {
+  /** uint64-range allocator for names that are only ever published on chain. */
+  nextChainSeq(name: string, floor = 0n): Promise<bigint> { return this.nextSeq(`chain:${name}`, floor, { chainOnly: true }); }
+
+  /**
+   * Allocate one version for an update of `name`, above everything already
+   * visible: the persisted counter, our own DHT record, and — at the LATEST
+   * block, not the lagged snapshot — the current owner's chain record plus the
+   * writer's own record (the writer may not be the owner yet). Single owner, so
+   * no other accounts matter. A read *failure* aborts; only absence counts as 0.
+   */
+  async allocateVersion(name: string, ethKey?: string): Promise<bigint> {
+    let floor = 0n;
+    const dht = await this.getRaw(this.pk, name); // throws on DHT error → abort
+    if (dht) {
+      if (!Number.isSafeInteger(dht.seq) || dht.seq < 0) throw new Error(`our DHT record for ${name} has an invalid seq`);
+      if (BigInt(dht.seq) > floor) floor = BigInt(dht.seq);
+    }
+    if (this.chain) {
+      const owner = await this.chain.latestOwner(this.pk); // throws on read failure → abort
+      const addrs = new Set<string>();
+      if (owner) addrs.add(owner.addr);
+      if (ethKey) addrs.add(this.chain.addressOf(ethKey));
+      for (const a of addrs) {
+        const latest = await this.chain.latestSeq(a as any, name);
+        if (latest > floor) floor = latest;
+      }
+    }
+    return this.nextSeq(name, floor);
+  }
+
+  /** Publish an own share to the on-chain registry. Pass the Share object (share --chain) or a name; `seq` reuses an already-allocated version. */
+  async publishToChain(ethKey: string, share: Share | string, licenseOverride?: string, seq?: bigint): Promise<{ share: Share; seq: bigint; tx: string; addr: string }> {
+    if (!this.chain) throw new Error('no registry configured');
+    let s: Share | undefined = typeof share === 'string' ? (await this.shares()).find((x) => x.own && x.name === share) : share;
+    if (!s) throw new Error(`no own share named ${share} (see: webway ls)`);
+    const addr = this.chain.addressOf(ethKey);
+    const v = seq ?? await this.allocateVersion(s.name, ethKey);
+    const tx = await this.chain.publish(ethKey, s.name, s.ih, licenseOverride ?? s.license, v);
+    return { share: s, seq: v, tx, addr };
+  }
+
+  private put(salt: string, v: unknown, seq: number | bigint): Promise<Buffer> {
+    // BEP44 seq travels as a JS number; the allocator hands out bigints capped at 2^53-1.
+    const n = typeof seq === 'bigint' ? Number(seq) : seq;
+    if (!Number.isSafeInteger(n) || n < 0) return Promise.reject(new Error(`seq ${seq} is not DHT-safe`));
     return new Promise((resolve, reject) => {
-      this.dht.put({ k: this.key.pk, salt: Buffer.from(salt), seq, v, sign: (buf: Buffer) => sign(this.key, buf) },
+      this.dht.put({ k: this.key.pk, salt: Buffer.from(salt), seq: n, v, sign: (buf: Buffer) => sign(this.key, buf) },
         (err: Error | null, hash: Buffer) => (err ? reject(err) : resolve(hash)));
     });
   }
@@ -588,23 +801,32 @@ export class WebwayNode {
     return createHash('sha1').update(Buffer.concat([Buffer.from(pk, 'hex'), Buffer.from(salt)])).digest();
   }
 
-  private get(pk: string, salt: string): Promise<any | null> {
+  private getRaw(pk: string, salt: string): Promise<{ v: any; seq: number } | null> {
     return new Promise((resolve, reject) => {
       this.dht.get(WebwayNode.targetFor(pk, salt), { salt: Buffer.from(salt) }, (err: Error | null, res: any) => {
         if (err) return reject(err);
         if (!res) return resolve(null);
         // bittorrent-dht only hands back mutable items whose signature verified against res.k
         void this.remember({ k: Buffer.from(res.k).toString('hex'), salt, v: Buffer.from(bencode.encode(res.v)).toString("base64"), sig: Buffer.from(res.sig).toString('hex'), seq: res.seq });
-        resolve(res.v);
+        resolve({ v: res.v, seq: Number(res.seq ?? 0) });
       });
     });
   }
 
-  async publishName(s: Share): Promise<void> {
-    const seq = await this.nextSeq(s.name);
-    const v: Record<string, unknown> = { ih: Buffer.from(s.ih, 'hex'), n: s.name, sz: s.size };
-    if (s.license) v.l = s.license;
-    await this.put(s.name, v, seq);
+  private async get(pk: string, salt: string): Promise<any | null> {
+    return (await this.getRaw(pk, salt))?.v ?? null;
+  }
+
+  get chain(): ChainRegistry | undefined { return this.opts.chain || undefined; }
+
+  async publishName(s: Share, seq?: bigint): Promise<void> {
+    const v = seq ?? await this.allocateVersion(s.name);
+    if (v > MAX_DHT_SEQ) throw new Error(`version ${v} is not DHT-safe`);
+    const rec: Record<string, unknown> = { ih: Buffer.from(s.ih, 'hex'), n: s.name, sz: s.size };
+    if (s.license) rec.l = s.license;
+    const own = await this.ownBinding();
+    if (own) { rec.a = Buffer.from(own.addr.slice(2), 'hex'); rec.e = own.epoch.toString(); }
+    await this.put(s.name, rec, Number(v));
   }
 
   /** Our catalog: every share we own, as a tiny torrent; the DHT record just points at it. */
@@ -624,36 +846,87 @@ export class WebwayNode {
     for (const t of this.client.torrents) if (t.name === 'catalog') await new Promise<void>((r) => t.destroy({}, () => r()));
     const t = await this.seed(dir, 'catalog');
     const seq = await this.nextSeq('catalog');
-    await this.put('catalog', { ih: Buffer.from(t.infoHash, 'hex') }, seq);
+    await this.put('catalog', { ih: Buffer.from(t.infoHash, 'hex') }, Number(seq));
   }
 
   /** Resolve webway://<pk>/<name>, a magnet, or a bare infohash to an infohash + metadata. */
-  async resolve(ref: string): Promise<{ ih: string; name: string; size?: number; license?: string; pk?: string }> {
-    if (/^[0-9a-f]{40}$/i.test(ref)) return { ih: ref.toLowerCase(), name: ref };
+  async resolve(ref: string): Promise<Resolved> {
+    if (/^[0-9a-f]{40}$/i.test(ref)) return { ih: ref.toLowerCase(), name: ref, source: 'ref' };
     const m = /^magnet:.*xt=urn:btih:([0-9a-f]{40})/i.exec(ref);
-    if (m) return { ih: m[1].toLowerCase(), name: m[1] };
+    if (m) return { ih: m[1].toLowerCase(), name: m[1], source: 'ref' };
     const w = /^(?:webway:\/\/)?([0-9a-f]{64})\/(.+)$/i.exec(ref);
     if (!w) throw new Error(`unrecognised ref: ${ref} (want webway://<pk>/<name>, magnet, or infohash)`);
-    const [, pk, name] = w;
-    const v = await this.get(pk.toLowerCase(), name);
-    if (!v) throw new Error(`no signed record for ${name} under ${pk.slice(0, 12)}… (publisher offline > 2h and nobody re-put it?)`);
-    return { ih: Buffer.from(v.ih).toString('hex'), name: String(v.n), size: Number(v.sz), license: v.l ? String(v.l) : undefined, pk };
+    const pk = w[1].toLowerCase(); const name = w[2];
+
+    // Path 1: the DHT (signed BEP44 record). Anything malformed or for another name is a failed source.
+    let fromDht: Resolved | null = null; let dhtNote: string | undefined; let dhtHint: Hint | undefined;
+    try {
+      const raw = await this.getRaw(pk, name);
+      if (raw) {
+        const rec = parseDhtRecord(raw.v, name);
+        if (!rec) dhtNote = 'DHT record malformed or for a different name; ignored';
+        else if (!Number.isSafeInteger(raw.seq) || raw.seq < 0) dhtNote = 'DHT record has an invalid seq; ignored';
+        else { fromDht = { ih: rec.ih, size: rec.size, license: rec.license, name, pk, seq: BigInt(raw.seq), source: 'dht' }; dhtHint = rec.hint; }
+      }
+    } catch (e) { dhtNote = `DHT lookup failed: ${(e as Error).message}`; }
+
+    // Path 2: the on-chain registry (permanent; the binding was verified by the contract; read at one
+    // hash-pinned block). The a/e carried in the DHT record is only cross-checked against ownerOf.
+    let fromChain: Resolved | null = null; let chainNote: string | undefined; let snapshot: Resolved['snapshot'];
+    if (this.chain) {
+      this.kickBootstrap(pk);
+      try {
+        const v = await this.chain.verified(pk, name);
+        snapshot = { height: v.height, hash: v.hash };
+        const c = v.record;
+        if (c) fromChain = { ih: c.ih, name, license: c.license, pk, seq: c.seq, source: 'chain' };
+        if (dhtHint && v.owner && (dhtHint.addr !== v.owner.addr || dhtHint.epoch !== v.owner.epoch)) {
+          chainNote = `dht-hint-mismatch: DHT record names account ${dhtHint.addr} epoch ${dhtHint.epoch} but the chain owner is ${v.owner.addr} epoch ${v.owner.epoch} (chain is authoritative; the DHT record may predate a re-bind)`;
+        }
+      } catch (e) { chainNote = `chain lookup failed: ${(e as Error).message}`; }
+    }
+
+    const notes = [dhtNote, chainNote].filter(Boolean) as string[];
+    const withNotes = (r0: Resolved, extra?: string) => {
+      const r = snapshot ? { ...r0, snapshot } : r0;
+      const w = [extra, ...notes].filter(Boolean); return w.length ? { ...r, warning: w.join('; ') } : r;
+    };
+
+    if (fromDht && fromChain) {
+      const d = fromDht, c = fromChain;
+      if (d.ih === c.ih) {
+        // Same content: take the newer metadata, size is valid for both.
+        const newer = c.seq! > d.seq! ? c : d;
+        return withNotes({ ...newer, size: d.size });
+      }
+      // Different content: highest seq wins; equal seq → chain (immutable, verified). Size only travels with its infohash.
+      if (c.seq! > d.seq!) return withNotes(c, `conflict: DHT (seq ${d.seq}, ${d.ih.slice(0, 12)}…) is older than chain (seq ${c.seq}, ${c.ih.slice(0, 12)}…); using chain`);
+      if (d.seq! > c.seq!) return withNotes(d, `conflict: chain (seq ${c.seq}, ${c.ih.slice(0, 12)}…) is older than DHT (seq ${d.seq}, ${d.ih.slice(0, 12)}…); using dht`);
+      return withNotes(c, `conflict-equal-seq: DHT ${d.ih.slice(0, 12)}… and chain ${c.ih.slice(0, 12)}… both claim seq ${d.seq}; using chain`);
+    }
+    if (fromDht) return withNotes(fromDht);
+    if (fromChain) return withNotes(fromChain);
+    throw new Error(`no record for ${name} under ${pk.slice(0, 12)}… (DHT: ${dhtNote ?? 'none'}${this.chain ? `; chain: ${chainNote ?? 'none'}` : ''})`);
   }
 
   /** Download a model into ~/.webway/models/<name>, verifying every piece, and keep seeding it. */
-  async fetch(ref: string, onProgress?: (t: Torrent) => void): Promise<Share> {
+  async fetch(ref: string, onProgress?: (t: Torrent) => void, onResolved?: (r: Resolved) => void): Promise<Share & { warning?: string }> {
     const r = await this.resolve(ref);
+    onResolved?.(r);
     const path = join(this.modelsDir(), ...r.name.split('/'));
     await mkdir(path, { recursive: true });
+    // The same content may already be held under another name (or from an earlier get): reuse the torrent.
+    const existing: Torrent | undefined = await (this.client as any).get(r.ih);
     const t = await new Promise<Torrent>((resolve, reject) => {
-      const t = this.client.add(r.ih, { path, announce: [] } as any);
+      const t = existing ?? this.client.add(r.ih, { path, announce: [] } as any);
+      if (existing && (existing as any).done) return resolve(existing);
       t.once('error', reject);
       t.once('done', () => { this.track(t.infoHash, torrentRoot(t, path)); resolve(t); });
       if (onProgress) { const i = setInterval(() => onProgress(t), 1000); t.once('done', () => clearInterval(i)); t.once('error', () => clearInterval(i)); }
     });
-    const share: Share = { name: r.name, ih: t.infoHash, dir: torrentRoot(t, path), size: t.length, license: r.license, own: false };
+    const share: Share = { name: r.name, ih: t.infoHash, dir: torrentRoot(t, existing ? (t as any).path : path), size: t.length, license: r.license, own: false };
     await this.upsertShare(share);
-    return share;
+    return r.warning ? { ...share, warning: r.warning } : share;
   }
 
   // ---- catalogs (issue #3) ----------------------------------------------
