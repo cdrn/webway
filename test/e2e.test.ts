@@ -46,8 +46,15 @@ test('publisher signs a name, stranger resolves it via DHT, downloads verified, 
     // Publisher goes dark. Bob can still get it from Alice (the Napster property).
     lap('searched');
     await pub.stop();
+    // ...and the *name* survives too: wipe every DHT node's value store, let Alice
+    // re-put the signed records she holds, and a newcomer can still resolve (#2).
+    router.dht._values.clear(); alice.dht._values.clear();
+    assert.equal(await alice.republish(), 2); // name record + catalog record
+    lap('alice re-put');
     const bob = await new WebwayNode({ home: join(root, 'bob'), bootstrap: boot, nat: false }).start();
     try {
+      const viaName = await bob.resolve(ref);
+      assert.equal(viaName.ih, share.ih);
       const got2 = await bob.fetch(share.ih);
       assert.equal(await readFile(join(got2.dir, 'model.safetensors')).then((b) => b.equals(w1)), true);
       lap('bob fetched from alice');

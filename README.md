@@ -23,7 +23,7 @@ webway follow 9f3c…e21a && webway search llama
 | someone swaps the bytes | infohash *is* the content; every piece is hash-verified |
 | someone hijacks a name | `webway://<pk>/<name>` is an ed25519-signed mutable item; DHT nodes drop bad signatures |
 | bootstrap routers blocked | five builtin routers + your persisted routing table + `--peer host:port` |
-| publisher goes dark | anyone who downloaded is seeding; names stay resolvable while anyone re-puts them |
+| publisher goes dark | anyone who downloaded is seeding, and re-puts the signed name record; names outlive publishers |
 | trackers subpoenaed | trackers are disabled; discovery is DHT + PEX only |
 | NAT | uTP, UPnP/NAT-PMP, PEX via webtorrent |
 
@@ -65,9 +65,10 @@ webway search <q>                  search followed catalogs
 webway ls                          what you hold
 ```
 
-Names expire from the DHT after ~2h unless re-put, so run `webway serve`
-somewhere that stays up. Anyone can re-put a record they hold (it is signed),
-so a well-followed model outlives its publisher.
+Names expire from the DHT after ~2h unless re-put. Every node re-puts every
+signed record it has ever resolved (`webway serve` does this every 50 min),
+so a name outlives its publisher for as long as anyone who fetched it is online.
+Nobody can forge a record; they can only keep it alive.
 
 ## Dev
 

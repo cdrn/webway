@@ -1,4 +1,5 @@
 import WebTorrent, { type Torrent } from 'webtorrent';
+import bencode from 'bencode';
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile, readdir } from 'node:fs/promises';
 import { join, basename } from 'node:path';
@@ -27,6 +28,8 @@ export const EXTRA_BOOTSTRAP = [
 ];
 
 export interface Record_ { ih: string; name: string; size: number; license?: string; seq: number }
+/** A signed BEP44 item we hold and will keep alive on behalf of its publisher. */
+export interface HeldRecord { k: string; salt: string; v: string; sig: string; seq: number }
 export interface CatalogEntry { name: string; ih: string; size: number; license?: string }
 export interface Share { name: string; ih: string; dir: string; size: number; license?: string; own: boolean }
 
@@ -144,15 +147,63 @@ export class WebwayNode {
     for (const s of shares) {
       await new Promise<void>((r) => { const t = this.client.add(s.ih, { path: join(s.dir, '..'), announce: [] } as any, () => r()); t.once('error', () => r()); });
     }
-    const republish = async () => {
-      for (const s of shares) if (s.own) await this.publishName(s).catch(() => {});
-      await this.publishCatalog().catch(() => {});
-    };
-    await republish();
-    const t = setInterval(() => void republish(), 50 * 60_000);
+    await this.republish();
+    const t = setInterval(() => void this.republish().catch(() => {}), 50 * 60_000);
     t.unref();
     this.timers.push(t);
     return shares;
+  }
+
+  // ---- held records (issue #2) ------------------------------------------
+  // Anyone can re-put a signed BEP44 item; only the publisher can mint one.
+  // So every node re-puts every record it has resolved, and a name outlives
+  // its publisher for as long as anyone who cares is online.
+
+  held() { return this.readJson<Record<string, HeldRecord>>('records.json', {}); }
+
+  private rememberChain: Promise<void> = Promise.resolve();
+  private remember(r: HeldRecord): Promise<void> {
+    // serialised: get() fires these concurrently and records.json is read-modify-write
+    return (this.rememberChain = this.rememberChain.then(async () => {
+      const all = await this.held();
+      const key = `${r.k}/${r.salt}`;
+      if ((all[key]?.seq ?? -1) >= r.seq) return;
+      all[key] = r;
+      await this.writeJson('records.json', all);
+    }).catch(() => {}));
+  }
+
+  private putHeld(r: HeldRecord): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.dht.put({ k: Buffer.from(r.k, 'hex'), salt: Buffer.from(r.salt), v: bencode.decode(Buffer.from(r.v, 'base64')), sig: Buffer.from(r.sig, 'hex'), seq: r.seq },
+        (err: Error | null) => (err ? reject(err) : resolve()));
+    });
+  }
+
+  /**
+   * Keep everything alive: our own names + catalog, then every record we hold.
+   * Before re-putting a held record we look for a newer seq so we never push
+   * a stale version over a publisher's update. Also walks followed publishers'
+   * catalogs so their names get held too. Returns how many records were re-put.
+   */
+  async republish(): Promise<number> {
+    const shares = await this.shares();
+    if (shares.some((s) => s.own)) {
+      for (const s of shares) if (s.own) await this.publishName(s).catch(() => {});
+      await this.publishCatalog().catch(() => {});
+    }
+    for (const pk of await this.follows()) {
+      const entries = await this.catalog(pk).catch(() => [] as CatalogEntry[]);
+      for (const e of entries.slice(0, 200)) await this.get(pk, e.name).catch(() => {});
+    }
+    let n = 0;
+    for (const r of Object.values(await this.held())) {
+      if (r.k === this.pk) continue; // ours; already re-signed above
+      await this.get(r.k, r.salt).catch(() => {}); // refreshes records.json if a newer seq exists
+      const latest = (await this.held())[`${r.k}/${r.salt}`] ?? r;
+      try { await this.putHeld(latest); n++; } catch (e) { if (process.env.WEBWAY_DEBUG) console.error("re-put failed", r.salt, e); }
+    }
+    return n;
   }
 
   // ---- names (BEP44) -----------------------------------------------------
@@ -183,6 +234,7 @@ export class WebwayNode {
         if (err) return reject(err);
         if (!res) return resolve(null);
         // bittorrent-dht only hands back mutable items whose signature verified against res.k
+        void this.remember({ k: Buffer.from(res.k).toString('hex'), salt, v: Buffer.from(bencode.encode(res.v)).toString("base64"), sig: Buffer.from(res.sig).toString('hex'), seq: res.seq });
         resolve(res.v);
       });
     });
