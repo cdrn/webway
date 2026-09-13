@@ -10,7 +10,7 @@
   "scripts": {
     "build": "tsc",
     "dev": "node --experimental-strip-types src/cli.ts",
-    "test": "node --experimental-strip-types --test --test-force-exit test/*.test.ts"
+    "test": "node --experimental-strip-types --test --test-force-exit --test-concurrency=1 test/*.test.ts"
   },
   "engines": {
     "node": ">=22"

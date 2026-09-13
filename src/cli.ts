@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { resolve as resolvePath } from 'node:path';
 import { WebwayNode, type NodeOpts } from './node.ts';
+import { parseSearchOpts } from './args.ts';
 
 const USAGE = `webway — Napster for model weights, on Mainline DHT
 
@@ -12,7 +13,8 @@ const USAGE = `webway — Napster for model weights, on Mainline DHT
   webway serve                              reseed everything you hold, keep names alive
   webway resolve <ref>                      show what a name currently points at
   webway follow <pk>                        subscribe to a publisher's catalog
-  webway search <query>                     search followed publishers' catalogs
+  webway search <query> [--depth n] [--max n]
+                                            search the web of publishers you follow (default depth 2, max 50)
   webway ls                                 what you hold
 
   flags: --peer host:port (extra DHT node, repeatable)  --torrent-port N  --dht-port N
@@ -36,6 +38,8 @@ async function main() {
   const [cmd, ...rest] = args;
   if (!cmd || cmd === 'help') { console.log(USAGE); return; }
   const opts: NodeOpts = { peers: flags.peer, torrentPort: Number(flags['torrent-port']?.[0]) || undefined, dhtPort: Number(flags['dht-port']?.[0]) || undefined };
+  // validate search flags before paying for a node start
+  const searchOpts = cmd === 'search' ? parseSearchOpts(flags) : {};
   const node = await new WebwayNode(opts).start();
   const stay = () => { console.log('seeding — ctrl-c to stop'); process.on('SIGINT', () => node.stop().then(() => process.exit(0))); };
   const status = () => setInterval(() => {
@@ -66,8 +70,8 @@ async function main() {
     case 'resolve': { console.log(await node.resolve(rest[0])); await node.stop(); return; }
     case 'follow': { await node.follow(rest[0]); console.log(`following ${rest[0]}`); await node.stop(); return; }
     case 'search': {
-      const r = await node.search(rest.join(' '));
-      for (const e of r) console.log(`${fmt(e.size).padStart(10)}  ${e.name.padEnd(40)} ${e.license ?? '-'}\n            webway://${e.pk}/${e.name}`);
+      const r = await node.search(rest.join(' '), searchOpts);
+      for (const e of r) console.log(`${fmt(e.size).padStart(10)}  ${String(e.hops).padStart(2)} hops  ${e.name.padEnd(40)} ${e.license ?? '-'}\n                     webway://${e.pk}/${e.name}`);
       if (!r.length) console.log('nothing found (follow some publishers first: webway follow <pk>)');
       await node.stop(); return;
     }

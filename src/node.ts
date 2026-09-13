@@ -1,8 +1,8 @@
 import WebTorrent, { type Torrent } from 'webtorrent';
 import bencode from 'bencode';
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, writeFile, readdir } from 'node:fs/promises';
-import { join, basename } from 'node:path';
+import { mkdir, readFile, writeFile, rm, rmdir } from 'node:fs/promises';
+import { join, basename, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { loadOrCreate, sign, verify, type Keypair } from './keys.ts';
 
@@ -31,6 +31,11 @@ export interface Record_ { ih: string; name: string; size: number; license?: str
 /** A signed BEP44 item we hold and will keep alive on behalf of its publisher. */
 export interface HeldRecord { k: string; salt: string; v: string; sig: string; seq: number }
 export interface CatalogEntry { name: string; ih: string; size: number; license?: string }
+export interface Catalog { entries: CatalogEntry[]; endorse: string[] }
+export interface SearchHit extends CatalogEntry { pk: string; hops: number }
+export interface SearchOpts { depth?: number; maxPublishers?: number }
+/** Lifecycle record for one catalog torrent (one per infohash). */
+interface TorrentRef { ih: string; torrent: Torrent; owned: boolean; dir?: string; readers: number; retainedBy: Set<string>; lastUse: number }
 export interface Share { name: string; ih: string; dir: string; size: number; license?: string; own: boolean }
 
 export interface NodeOpts {
@@ -40,6 +45,10 @@ export interface NodeOpts {
   dhtPort?: number;
   peers?: string[]; // extra DHT nodes host:port
   nat?: boolean; // UPnP/NAT-PMP port mapping (default on)
+  catalogTimeoutMs?: number; // per-publisher catalog fetch deadline (default 20s)
+  searchTimeoutMs?: number; // overall search deadline (default 120s)
+  catalogCacheMax?: number; // in-memory parsed-catalog cache entries (default 200; 0 = no cache)
+  catalogTorrentsMax?: number; // owned catalog torrents kept alive (default 200, LRU)
 }
 
 /** Where a torrent's files landed: multi-file torrents nest under t.name, single-file ones don't. */
@@ -55,6 +64,10 @@ export class WebwayNode {
   private opts: NodeOpts;
 
   constructor(opts: NodeOpts = {}) {
+    if (opts.catalogTimeoutMs !== undefined) checkInt('catalogTimeoutMs', opts.catalogTimeoutMs, WebwayNode.CATALOG_TIMEOUT_MAX_MS);
+    if (opts.searchTimeoutMs !== undefined) checkInt('searchTimeoutMs', opts.searchTimeoutMs, WebwayNode.SEARCH_TIMEOUT_MAX_MS);
+    if (opts.catalogCacheMax !== undefined) checkInt('catalogCacheMax', opts.catalogCacheMax, WebwayNode.CATALOG_CACHE_MAX_MAX);
+    if (opts.catalogTorrentsMax !== undefined) checkInt('catalogTorrentsMax', opts.catalogTorrentsMax, WebwayNode.CATALOG_TORRENTS_MAX_MAX);
     this.opts = opts;
     this.home = opts.home ?? process.env.WEBWAY_HOME ?? join(homedir(), '.webway');
   }
@@ -253,7 +266,9 @@ export class WebwayNode {
       .map(({ name, ih, size, license }) => ({ name, ih, size, license }));
     const dir = join(this.home, 'catalog');
     await mkdir(dir, { recursive: true });
-    await writeFile(join(dir, 'catalog.json'), JSON.stringify({ pk: this.pk, entries }, null, 2));
+    // endorse = who we follow; other nodes walk this to widen search (#3)
+    const endorse = (await this.follows()).filter((pk) => pk !== this.pk);
+    await writeFile(join(dir, 'catalog.json'), JSON.stringify({ pk: this.pk, entries, endorse }, null, 2));
     for (const t of this.client.torrents) if (t.name === 'catalog') await new Promise<void>((r) => t.destroy({}, () => r()));
     const t = await this.seed(dir, 'catalog');
     const seq = await this.nextSeq('catalog');
@@ -289,34 +304,375 @@ export class WebwayNode {
     return share;
   }
 
+  // ---- catalogs (issue #3) ----------------------------------------------
+  // Transitive search exposes this path to publishers the user never chose, so
+  // every step is bounded: each caller has an absolute deadline covering DHT
+  // lookup + acquisition + metadata + download + file read; torrent size is
+  // checked before the body downloads; entries/endorsements/results are capped.
+  //
+  // Torrent lifecycle is one record per infohash (TorrentRef): `owned` means we
+  // started the download and may destroy it; `readers` are in-flight loads;
+  // `retainedBy` are publishers whose *current* catalog it is. A torrent is
+  // destroyed only when owned && readers === 0 && retainedBy.size === 0, and
+  // always by its stored object, never by a fresh lookup of the hash (an
+  // external reseed of the same hash is never ours to delete). Destroy and
+  // reacquire are serialised per infohash.
+
+  static readonly CATALOG_MAX_BYTES = 1 << 20;
+  static readonly CATALOG_MAX_ENTRIES = 5000;
+  static readonly CATALOG_MAX_ENDORSE = 100;
+  static readonly SEARCH_MAX_RESULTS = 1000;
+  static readonly SEARCH_MAX_DEPTH = 5;
+  static readonly SEARCH_MAX_PUBLISHERS = 500;
+  static readonly CATALOG_TIMEOUT_MAX_MS = 600_000;
+  static readonly SEARCH_TIMEOUT_MAX_MS = 3_600_000;
+  static readonly CATALOG_CACHE_MAX_MAX = 100_000;
+  static readonly CATALOG_TORRENTS_MAX_MAX = 100_000;
+
+  private catalogCache = new Map<string, Catalog>(); // `${pk}/${ih}` -> parsed catalog (insertion-ordered; LRU)
+  private catalogInflight = new Map<string, { promise: Promise<Catalog>; waiters: number; ctl: AbortController; settled: boolean; aborted: boolean }>();
+  private gen = 0; // generation counter for owned download directories
+  private refs = new Map<string, TorrentRef>(); // ih -> lifecycle record
+  private ihTails = new Map<string, Promise<void>>(); // per-ih serialisation of destroy/reacquire
+  private current = new Map<string, TorrentRef>(); // pk -> ref of its current catalog torrent
+  /** Catalog torrents we started downloading (cache misses that were not reusable locally); exposed for tests. */
+  catalogFetches = 0;
+  /** Catalog torrents refused for exceeding CATALOG_MAX_BYTES; exposed for tests. */
+  catalogRefused = 0;
+  /** Lifecycle errors that happened off the critical path (retirement); exposed for tests/logging. */
+  lifecycleErrors: Error[] = [];
+  get catalogCacheSize() { return this.catalogCache.size; }
+  /** Owned catalog torrents currently alive. */
+  get catalogTorrentCount() { return [...this.refs.values()].filter((r) => r.owned && !(r.torrent as any).destroyed).length; }
+
   /** Fetch a publisher's catalog torrent and return its entries. */
   async catalog(pk: string): Promise<CatalogEntry[]> {
-    const v = await this.get(pk, 'catalog');
-    if (!v) return [];
-    const ih = Buffer.from(v.ih).toString('hex');
-    const dir = join(this.home, 'catalogs', pk);
-    await mkdir(dir, { recursive: true });
-    const existing = await (this.client as any).get(ih);
-    if (existing) await new Promise<void>((r) => existing.destroy({}, () => r()));
-    const t = await new Promise<Torrent>((resolve, reject) => {
-      const t = this.client.add(ih, { path: dir, announce: [] } as any);
-      t.once('error', reject); t.once('done', () => resolve(t));
-    });
-    const root = torrentRoot(t, dir);
-    const files = await readdir(root);
-    if (!files.includes('catalog.json')) return [];
-    const j = JSON.parse(await readFile(join(root, 'catalog.json'), 'utf8'));
-    return j.entries as CatalogEntry[];
+    return (await this.catalogFull(pk)).entries;
   }
 
-  /** Search across every followed publisher's catalog. */
-  async search(q: string): Promise<(CatalogEntry & { pk: string })[]> {
-    const out: (CatalogEntry & { pk: string })[] = [];
-    const needle = q.toLowerCase();
-    for (const pk of await this.follows()) {
-      const entries = await this.catalog(pk).catch(() => [] as CatalogEntry[]);
-      for (const e of entries) if (e.name.toLowerCase().includes(needle)) out.push({ ...e, pk });
+  /**
+   * Fetch a publisher's catalog (entries + endorsed publishers), bounded by an
+   * absolute per-caller deadline (`deadlineMs`, default opts.catalogTimeoutMs,
+   * 20s). Never throws for a missing/unreachable/oversized/malformed catalog:
+   * returns an empty catalog. Parsed catalogs are cached per pk+infohash (LRU,
+   * opts.catalogCacheMax entries; 0 disables the cache). Concurrent loads of the
+   * same key share one underlying load; each caller still leaves at its own
+   * deadline, and the load is cancelled only once no caller is waiting.
+   */
+  async catalogFull(pk: string, deadlineMs?: number): Promise<Catalog> {
+    const empty: Catalog = { entries: [], endorse: [] };
+    const budget = Math.max(0, deadlineMs ?? this.opts.catalogTimeoutMs ?? 20_000);
+    const deadline = Date.now() + budget;
+    if (!/^[0-9a-f]{64}$/.test(pk)) return empty;
+    let v: any;
+    try { v = await withDeadline(this.get(pk, 'catalog'), deadline, 'catalog record lookup'); } catch (e) { debug(`catalog ${pk.slice(0, 8)}: lookup failed: ${(e as Error).message}`); return empty; }
+    if (!v || !(v.ih instanceof Uint8Array)) { debug(`catalog ${pk.slice(0, 8)}: no record`); return empty; }
+    const ih = Buffer.from(v.ih).toString('hex');
+    if (!/^[0-9a-f]{40}$/.test(ih)) return empty;
+    const key = `${pk}/${ih}`;
+    const cached = this.catalogCache.get(key);
+    if (cached) {
+      this.catalogCache.delete(key); this.catalogCache.set(key, cached); // LRU touch
+      const live = this.current.get(pk);
+      if (live && live.ih === ih) live.lastUse = Date.now(); // keep a hot publisher's torrent hot too
+      return cached;
     }
-    return out;
+    let inflight = this.catalogInflight.get(key);
+    if (!inflight || inflight.aborted) {
+      const ctl = new AbortController();
+      const entry = { promise: null as unknown as Promise<Catalog>, waiters: 0, ctl, settled: false, aborted: false };
+      entry.promise = this.loadCatalog(pk, ih, ctl.signal).finally(() => {
+        entry.settled = true;
+        if (this.catalogInflight.get(key) === entry) this.catalogInflight.delete(key);
+      });
+      entry.promise.catch(() => {}); // observed by waiters; never unhandled
+      this.catalogInflight.set(key, entry);
+      inflight = entry;
+    }
+    inflight.waiters++;
+    try {
+      return await withDeadline(inflight.promise, deadline, 'catalog load');
+    } catch (e) {
+      debug(`catalog ${pk.slice(0, 8)}/${ih.slice(0, 8)}: load failed: ${(e as Error).message}`);
+      return empty;
+    } finally {
+      inflight.waiters--;
+      if (inflight.waiters === 0 && !inflight.settled && !inflight.aborted) {
+        // nobody is waiting any more: cancel, and never let a newcomer join this doomed load
+        inflight.aborted = true;
+        inflight.ctl.abort();
+        if (this.catalogInflight.get(key) === inflight) this.catalogInflight.delete(key);
+      }
+    }
   }
+
+  /** Resolve once every queued destroy/reacquire has settled (retirement runs off the critical path). */
+  async lifecycleIdle(): Promise<void> {
+    while (this.ihTails.size) await Promise.all([...this.ihTails.values()]);
+  }
+
+  /** Run `fn` after every earlier operation on this infohash has settled. */
+  private serial<T>(ih: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.ihTails.get(ih) ?? Promise.resolve();
+    const run = prev.then(fn);
+    const tail = run.then(() => {}, () => {});
+    this.ihTails.set(ih, tail);
+    void tail.then(() => { if (this.ihTails.get(ih) === tail) this.ihTails.delete(ih); });
+    return run;
+  }
+
+  /**
+   * Take a reader reference on the torrent for `ih`: reuse one the client
+   * already has (a seed, a model download, another publisher's identical
+   * catalog) and never own it, or start a download we do own.
+   */
+  private acquire(pk: string, ih: string, signal: AbortSignal): Promise<TorrentRef> {
+    return this.serial(ih, async () => {
+      if (signal.aborted) throw new Error('aborted');
+      let ref = this.refs.get(ih);
+      if (ref && (ref.torrent as any).destroyed) {
+        // stale record: detach every publisher still pointing at it so its cleanup never targets the replacement
+        for (const rpk of [...ref.retainedBy]) { if (this.current.get(rpk) === ref) this.current.delete(rpk); }
+        ref.retainedBy.clear();
+        this.refs.delete(ih);
+        this.maybeDestroy(ref); // no-op destroy of the dead object; removes its own generation dir
+        ref = undefined;
+      }
+      if (!ref) {
+        const existing: Torrent | undefined = await (this.client as any).get(ih);
+        if (existing) {
+          ref = { ih, torrent: existing, owned: false, readers: 0, retainedBy: new Set(), lastUse: Date.now() };
+        } else {
+          this.catalogFetches++;
+          debug(`catalog download ${ih.slice(0, 8)} for ${pk.slice(0, 8)} (refs=${this.refs.size})`);
+          const dir = join(this.home, 'catalogs', pk, ih, String(++this.gen)); // generation-specific: cleanup of an old ref can never touch a newer download
+          await mkdir(dir, { recursive: true });
+          const torrent = this.client.add(ih, { path: dir, announce: [] } as any);
+          ref = { ih, torrent, owned: true, dir, readers: 0, retainedBy: new Set(), lastUse: Date.now() };
+        }
+        this.refs.set(ih, ref);
+      }
+      ref.readers++;
+      ref.lastUse = Date.now();
+      return ref;
+    });
+  }
+
+  private release(ref: TorrentRef): void {
+    ref.readers--;
+    this.maybeDestroy(ref);
+    this.capTorrents(); // a torrent that just went idle may now be evictable
+  }
+
+  /** Make `ref` publisher `pk`'s current catalog torrent; the previous one loses that retention. */
+  private retain(pk: string, ref: TorrentRef): void {
+    const prev = this.current.get(pk);
+    if (prev === ref) return;
+    if (prev) { prev.retainedBy.delete(pk); this.maybeDestroy(prev); }
+    ref.retainedBy.add(pk);
+    ref.lastUse = Date.now();
+    this.current.set(pk, ref);
+    this.capTorrents();
+  }
+
+  /** Drop `pk`'s retention of its current catalog torrent (cache eviction). */
+  private retire(pk: string, ih?: string): void {
+    const ref = this.current.get(pk);
+    if (!ref || (ih && ref.ih !== ih)) return;
+    this.current.delete(pk);
+    ref.retainedBy.delete(pk);
+    this.maybeDestroy(ref);
+  }
+
+  /** Keep at most opts.catalogTorrentsMax owned catalog torrents, evicting least recently used idle ones. */
+  private capTorrents(): void {
+    const max = this.opts.catalogTorrentsMax ?? 200;
+    const owned = [...this.refs.values()].filter((r) => r.owned && !(r.torrent as any).destroyed);
+    if (owned.length <= max) return;
+    owned.sort((a, b) => a.lastUse - b.lastUse);
+    let excess = owned.length - max;
+    for (const r of owned) { // least recently used first; skip busy ones and keep scanning until enough idle ones are picked
+      if (excess <= 0) break;
+      if (r.readers > 0) continue;
+      for (const pk of [...r.retainedBy]) { if (this.current.get(pk) === r) this.current.delete(pk); r.retainedBy.delete(pk); }
+      this.maybeDestroy(r);
+      excess--;
+    }
+  }
+
+  /**
+   * Destroy an owned torrent once nothing uses it. Borrowed torrents are merely
+   * forgotten. Off the critical path: errors are collected, never thrown.
+   */
+  private maybeDestroy(ref: TorrentRef): void {
+    if (ref.readers > 0 || ref.retainedBy.size > 0) return;
+    if (!ref.owned) { if (this.refs.get(ref.ih) === ref) this.refs.delete(ref.ih); return; }
+    void this.serial(ref.ih, async () => {
+      if (ref.readers > 0 || ref.retainedBy.size > 0) return; // re-acquired while queued
+      if (this.refs.get(ref.ih) === ref) this.refs.delete(ref.ih);
+      await this.destroyTorrent(ref.torrent, true);
+      if (ref.dir) {
+        await rm(ref.dir, { recursive: true, force: true });
+        await rmdir(dirname(ref.dir)).catch(() => {}); // drop the <ih> dir if this was its last generation
+        await rmdir(dirname(dirname(ref.dir))).catch(() => {}); // ...and the <pk> dir if now empty
+      }
+    }).catch((e) => { this.lifecycleErrors.push(e instanceof Error ? e : new Error(String(e))); });
+  }
+
+  private async loadCatalog(pk: string, ih: string, signal: AbortSignal): Promise<Catalog> {
+    const key = `${pk}/${ih}`;
+    const ref = await this.acquire(pk, ih, signal);
+    const tor = ref.torrent;
+    try {
+      // 1. metadata (so we know the size) before any body bytes matter
+      await waitFor(tor, () => tor.files.length > 0, 'metadata', signal);
+      if (tor.length > WebwayNode.CATALOG_MAX_BYTES) {
+        this.catalogRefused++;
+        throw new Error(`catalog torrent ${ih} is ${tor.length} bytes (> ${WebwayNode.CATALOG_MAX_BYTES})`);
+      }
+      // 2. body
+      await waitFor(tor, () => tor.done, 'done', signal);
+      // 3. locate catalog.json through the torrent's own file manifest, never a directory listing
+      const file = tor.files.find((f: { path: string; name: string }) => f.name === 'catalog.json');
+      const cat: Catalog = file ? parseCatalog(await readFile(join(tor.path, file.path), { encoding: 'utf8', signal }), pk) : { entries: [], endorse: [] };
+      // 4. this is now pk's current catalog torrent; the previous one is retired off the critical path
+      this.retain(pk, ref);
+      const max = this.opts.catalogCacheMax ?? 200;
+      if (max > 0) {
+        this.catalogCache.set(key, cat);
+        while (this.catalogCache.size > max) {
+          const evicted = this.catalogCache.keys().next().value!;
+          this.catalogCache.delete(evicted);
+          const [epk, eih] = evicted.split('/');
+          this.retire(epk, eih);
+        }
+      }
+      return cat;
+    } finally {
+      this.release(ref);
+    }
+  }
+
+  private destroyTorrent(t: Torrent, destroyStore: boolean): Promise<void> {
+    return new Promise((r) => { try { if ((t as any).destroyed) return r(); t.destroy({ destroyStore } as any, () => r()); } catch { r(); } });
+  }
+
+  /**
+   * Search the web of publishers: BFS from your follow list along each catalog's
+   * `endorse` list. depth 0 = only publishers you follow; each hop widens to the
+   * publishers they endorse. Bounded by depth (<= SEARCH_MAX_DEPTH), maxPublishers
+   * (<= SEARCH_MAX_PUBLISHERS), SEARCH_MAX_RESULTS and an overall deadline
+   * (opts.searchTimeoutMs, default 120s). Cycles, self and unreachable publishers
+   * are skipped; a slow publisher costs at most one catalog timeout.
+   */
+  async search(q: string, opts: SearchOpts = {}): Promise<SearchHit[]> {
+    const depth = checkInt('depth', opts.depth === undefined ? 2 : opts.depth, WebwayNode.SEARCH_MAX_DEPTH);
+    const maxPublishers = checkInt('maxPublishers', opts.maxPublishers === undefined ? 50 : opts.maxPublishers, WebwayNode.SEARCH_MAX_PUBLISHERS);
+    const needle = String(q).toLowerCase();
+    const deadline = Date.now() + Math.max(0, this.opts.searchTimeoutMs ?? 120_000);
+    const queued = new Set<string>([this.pk]); // everything ever enqueued (plus self): never enqueue twice
+    const seen = new Set<string>(); // `${pk}/${ih}`
+    const out: SearchHit[] = [];
+    const finish = (hits: SearchHit[]) => hits.sort((a, b) => a.hops - b.hops || a.name.localeCompare(b.name));
+    let frontier: string[] = [];
+    for (const pk of await this.follows()) if (!queued.has(pk) && queued.size - 1 < maxPublishers) { queued.add(pk); frontier.push(pk); }
+    for (let hops = 0; hops <= depth && frontier.length; hops++) {
+      const next: string[] = [];
+      for (const pk of frontier) {
+        const left = deadline - Date.now();
+        if (left <= 0) return finish(out);
+        const cat = await this.catalogFull(pk, Math.min(left, this.opts.catalogTimeoutMs ?? 20_000));
+        for (const e of cat.entries) {
+          if (out.length >= WebwayNode.SEARCH_MAX_RESULTS) return finish(out);
+          const k = `${pk}/${e.ih}`;
+          if (seen.has(k) || !e.name.toLowerCase().includes(needle)) continue;
+          seen.add(k);
+          out.push({ ...e, pk, hops });
+        }
+        if (hops === depth) continue; // final depth: do not expand
+        for (const epk of cat.endorse) {
+          if (queued.size - 1 >= maxPublishers) break; // publisher budget spent
+          if (queued.has(epk)) continue;
+          queued.add(epk); next.push(epk);
+        }
+      }
+      frontier = next;
+    }
+    return finish(out);
+  }
+}
+
+/** Reject anything that is not a safe non-negative integer within [0, max]. */
+export function checkInt(name: string, v: unknown, max: number): number {
+  if (typeof v !== 'number' || !Number.isSafeInteger(v) || v < 0 || v > max) {
+    throw new RangeError(`${name} must be an integer in [0, ${max}], got ${String(v)}`);
+  }
+  return v;
+}
+
+/** Validate an untrusted catalog.json body; bad entries are dropped, good ones kept. */
+export function parseCatalog(text: string, pk: string): Catalog {
+  let j: any;
+  try { j = JSON.parse(text); } catch { return { entries: [], endorse: [] }; }
+  if (!j || typeof j !== 'object' || Array.isArray(j)) return { entries: [], endorse: [] };
+  const entries: CatalogEntry[] = [];
+  if (Array.isArray(j.entries)) {
+    for (const e of j.entries) {
+      if (entries.length >= WebwayNode.CATALOG_MAX_ENTRIES) break;
+      if (!e || typeof e !== 'object') continue;
+      if (typeof e.name !== 'string' || !e.name || e.name.length > 512) continue;
+      if (typeof e.ih !== 'string' || !/^[0-9a-f]{40}$/i.test(e.ih)) continue;
+      if (typeof e.size !== 'number' || !Number.isFinite(e.size) || e.size < 0) continue;
+      if (e.license !== undefined && typeof e.license !== 'string') continue;
+      const entry: CatalogEntry = { name: e.name, ih: e.ih.toLowerCase(), size: e.size };
+      if (typeof e.license === 'string') entry.license = e.license;
+      entries.push(entry);
+    }
+  }
+  const endorse: string[] = [];
+  if (Array.isArray(j.endorse)) {
+    const set = new Set<string>();
+    for (const x of j.endorse) {
+      if (endorse.length >= WebwayNode.CATALOG_MAX_ENDORSE) break;
+      if (typeof x !== 'string' || !/^[0-9a-f]{64}$/i.test(x)) continue;
+      const k = x.toLowerCase();
+      if (k === pk || set.has(k)) continue;
+      set.add(k); endorse.push(k);
+    }
+  }
+  return { entries, endorse };
+}
+
+function debug(msg: string): void {
+  if (process.env.WEBWAY_DEBUG) console.error(`[webway] ${msg}`);
+}
+
+/** Race `p` against an absolute deadline (ms since epoch). The underlying work is not cancelled here. */
+function withDeadline<T>(p: Promise<T>, deadline: number, what: string): Promise<T> {
+  const ms = deadline - Date.now();
+  if (ms <= 0) return Promise.reject(new Error(`${what}: deadline already passed`));
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`${what} timed out`)), ms);
+    p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+  });
+}
+
+/**
+ * Resolve once `ready()` holds, re-checking on `event`; reject if the torrent
+ * errors or closes first, or when `signal` aborts. Every listener it installs
+ * is removed on every exit path, so repeated timeouts never accumulate listeners.
+ */
+function waitFor(tor: Torrent, ready: () => boolean, event: string, signal: AbortSignal): Promise<void> {
+  const t = tor as any;
+  if (signal.aborted) return Promise.reject(new Error('aborted'));
+  if (ready()) return Promise.resolve();
+  if (t.destroyed) return Promise.reject(new Error('torrent closed'));
+  return new Promise((resolve, reject) => {
+    const off = () => { t.off(event, check); t.off('error', fail); t.off('close', closed); signal.removeEventListener('abort', aborted); };
+    const check = () => { if (ready()) { off(); resolve(); } };
+    const fail = () => { off(); reject(new Error('torrent error')); };
+    const closed = () => { off(); reject(new Error('torrent closed')); };
+    const aborted = () => { off(); reject(new Error('aborted')); };
+    t.on(event, check); t.on('error', fail); t.on('close', closed); signal.addEventListener('abort', aborted, { once: true });
+  });
 }

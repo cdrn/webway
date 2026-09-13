@@ -35,9 +35,18 @@ would also take down every BitTorrent client on earth.
 - **Transport obfuscation.** BitTorrent traffic is fingerprintable. An ISP that
   blocks the protocol wholesale needs a pluggable transport (obfs4, or tunnelling
   peer connections over a libp2p/WebRTC layer). Planned, not built.
-- **Global search.** There is no global index by design. Search works over the
-  catalogs of publishers you follow. A gossip layer where nodes re-share the
-  catalogs they know is the next step.
+- **Global search.** There is no global index by design. Search walks a web of
+  publishers instead: each catalog carries an `endorse` list (the publishers its
+  author follows), and `webway search` does a bounded breadth-first walk from
+  your follow list (default 2 hops, 50 publishers; hard maxima 5 and 500). Every
+  step is bounded because the walk reaches publishers you never chose: each
+  catalog fetch has a deadline (20s), catalogs over 1 MiB are refused before
+  download, entries/endorsements/results are capped (5000/100/1000), and a
+  malformed catalog costs nothing but its own entries. Catalog torrents are
+  reference-counted per infohash (a torrent we did not start is never destroyed;
+  one we did is destroyed only when no load and no publisher still uses it) and
+  capped at 200 kept alive, least recently used first. Cold start is still
+  "someone hands you one key"; from there the web is discoverable.
 - **BitTorrent v2.** webtorrent is v1 only, so identical files across model
   versions are not deduplicated in the swarm yet.
 - **Key rotation / multi-sig publishers.** One ed25519 key per publisher, in
@@ -61,7 +70,7 @@ webway get <ref>                   download and keep seeding (webway://, magnet,
 webway serve                       reseed everything you hold, keep names alive
 webway resolve <ref>               what a name points at right now
 webway follow <pk>                 subscribe to a publisher
-webway search <q>                  search followed catalogs
+webway search <q> [--depth n] [--max n]   walk the web of publishers you follow (2 hops / 50 publishers by default)
 webway ls                          what you hold
 ```
 
